@@ -80,10 +80,12 @@ def main():
         print(f"[警告] 市場データの取得で予期せぬエラー: {e}")
         market = {}
 
-    # 2. 日経平均の履歴（相対強さ計算用）
-    nikkei_df = data_fetcher.get_nikkei_history()
-    if nikkei_df is None:
-        print("[警告] 日経平均の履歴が取得できませんでした。相対強さは中立扱いになります。")
+    # 2. 市場平均(TOPIX連動ETF)の履歴（相対強さ計算の基準）
+    #    日経平均(^N225)は異常値を返すことがあるため、安定して取れるTOPIX ETFを基準にする。
+    benchmark_df = data_fetcher.get_benchmark_history()
+    if benchmark_df is None:
+        print("[警告] 市場平均(TOPIX連動ETF)の履歴が取得できませんでした。"
+              "相対強さは中立扱いになります。")
 
     # 3. 一次スクリーニング ----------------------------------------------------
     print("\n■ 一次スクリーニング（全候補を軽量データでふるい分け）")
@@ -122,26 +124,27 @@ def main():
     stats["detail_fetched"] = len(detail_histories)
 
     scored_stocks = stock_scorer.score_all(
-        detail_histories, nikkei_df=nikkei_df, top_n=FINAL_TOP_N
+        detail_histories, benchmark_df=benchmark_df, top_n=FINAL_TOP_N
     )
     stats["final"] = len(scored_stocks)
 
-    # 5. レポート出力（ターミナル表示＋LINE送信）
+    # 5. レポート出力（ターミナル表示＋LINE送信：Flexカード＋テキスト）
     report = report_writer.build_report(market, scored_stocks, stats)
+    flex = report_writer.build_flex_message(market, scored_stocks, stats)
     print()
     print(report)
-    _deliver(report)
+    _deliver(report, flex)
 
     return 0
 
 
-def _deliver(report):
+def _deliver(report, flex=None):
     """
-    レポートをLINEへ送信する。
+    レポートをLINEへ送信する（Flexカード＋テキスト本文）。
     環境変数が未設定ならスキップ、失敗しても全体は止めない。
     """
     try:
-        line_sender.send_report(report)
+        line_sender.send_report(report, flex=flex)
     except Exception as e:
         print(f"[警告] LINE送信処理で予期せぬエラー（処理は継続）: {e}")
 

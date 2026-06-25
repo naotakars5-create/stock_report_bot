@@ -7,7 +7,7 @@ stock_scorer.py
   1. 5日移動平均と25日移動平均の関係（短期トレンド）
   2. 25日移動平均と75日移動平均の関係（中期トレンド）
   3. 直近出来高が平均出来高より増えているか（人気・関心）
-  4. 日経平均に対して相対的に強いか（相対強さ）
+  4. 市場平均(TOPIX連動ETF)に対して相対的に強いか（相対強さ）
   5. 直近で急騰しすぎていないか（過熱の回避）
   6. ボラティリティが高すぎないか（安定性）
 
@@ -165,13 +165,14 @@ def _daily_volatility(series, days=20):
     return float(returns.std() * 100)
 
 
-def score_stock(history, nikkei_close=None):
+def score_stock(history, benchmark_close=None):
     """
     1銘柄をスコアリングする。
 
     引数:
         history: yfinance の OHLCV DataFrame
-        nikkei_close: 日経平均の Close Series（相対強さ計算用、無ければ None）
+        benchmark_close: 市場平均(TOPIX連動ETF)の Close Series
+                         （相対強さ計算用、無ければ None）
 
     戻り値:
         {
@@ -181,6 +182,7 @@ def score_stock(history, nikkei_close=None):
             "reasons": [注目理由の文字列, ...],
             "risks": [リスクの文字列, ...],
             "details": {観点ごとの素点},
+            "metrics": {テクニカル指標の生値},
         }
         計算できない場合は None。
     """
@@ -245,20 +247,20 @@ def score_stock(history, nikkei_close=None):
         s3 = WEIGHTS["出来高"] * 0.5  # 不明なら中立
     details["出来高"] = s3
 
-    # --- 4. 相対強さ: 直近20日の対日経平均 ---
+    # --- 4. 相対強さ: 直近20日の対 市場平均(TOPIX連動ETF) ---
     stock_20 = _pct_change(close, 20)
     rel = None
-    if stock_20 is not None and nikkei_close is not None and len(nikkei_close.dropna()) > 20:
-        nikkei_20 = _pct_change(nikkei_close, 20)
-        if nikkei_20 is not None:
-            rel = stock_20 - nikkei_20
+    if stock_20 is not None and benchmark_close is not None and len(benchmark_close.dropna()) > 20:
+        bench_20 = _pct_change(benchmark_close, 20)
+        if bench_20 is not None:
+            rel = stock_20 - bench_20
     if rel is not None:
         # -5%〜+5% を 0〜1 にマッピング
         s4 = _clamp((rel + 5) / 10) * WEIGHTS["相対強さ"]
         if rel > 0:
-            reasons.append(f"過去20日で日経平均を{rel:.1f}ポイント上回る相対的な強さ")
+            reasons.append(f"過去20日で市場平均(TOPIX)を{rel:.1f}ポイント上回る相対的な強さ")
         else:
-            risks.append(f"過去20日で日経平均を{abs(rel):.1f}ポイント下回る")
+            risks.append(f"過去20日で市場平均(TOPIX)を{abs(rel):.1f}ポイント下回る")
     else:
         s4 = WEIGHTS["相対強さ"] * 0.5
     details["相対強さ"] = s4
@@ -302,6 +304,17 @@ def score_stock(history, nikkei_close=None):
     if not risks:
         risks.append("現時点で目立ったリスクシグナルは検出されず")
 
+    # レポート/Flexで詳しく解説するためのテクニカル指標の生値
+    metrics = {
+        "gap_5_25": gap_5_25,       # 5日線が25日線を上回る割合(%)
+        "gap_25_75": gap_25_75,     # 25日線が75日線を上回る割合(%)
+        "vol_ratio": vol_ratio,     # 直近5日平均出来高 / 25日平均（None有）
+        "rel_strength": rel,        # 対 市場平均(TOPIX) 20日相対騰落(pt)（None有）
+        "surge_5": surge_5,         # 直近5日騰落率(%)（None有）
+        "volatility": vol_pct,      # 日次ボラティリティ(%)（None有）
+        "sma5": sma5, "sma25": sma25, "sma75": sma75,
+    }
+
     return {
         "score": round(score, 1),
         "price": price,
@@ -309,6 +322,7 @@ def score_stock(history, nikkei_close=None):
         "reasons": reasons,
         "risks": risks,
         "details": details,
+        "metrics": metrics,
     }
 
 
@@ -328,29 +342,30 @@ def _clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
 
 
-def score_all(stock_histories, nikkei_df=None, top_n=10):
+def score_all(stock_histories, benchmark_df=None, top_n=10):
     """
     全候補銘柄をスコアリングし、上位 top_n 件を返す。
 
     引数:
-        stock_histories: fetch_stock_histories の戻り値
-        nikkei_df: 日経平均の履歴 DataFrame
+        stock_histories: fetch_histories の戻り値
+        benchmark_df: 市場平均(TOPIX連動ETF)の履歴 DataFrame（相対強さの基準）
     戻り値:
-        スコア降順の銘柄リスト（各要素に code/name/score 等を含む）
+        スコア降順の銘柄リスト（各要素に code/name/sector/score/metrics 等を含む）
     """
-    nikkei_close = None
-    if nikkei_df is not None and "Close" in nikkei_df:
-        nikkei_close = nikkei_df["Close"]
+    benchmark_close = None
+    if benchmark_df is not None and "Close" in benchmark_df:
+        benchmark_close = benchmark_df["Close"]
 
     scored = []
     for item in stock_histories:
-        result = score_stock(item["history"], nikkei_close=nikkei_close)
+        result = score_stock(item["history"], benchmark_close=benchmark_close)
         if result is None:
             print(f"[警告] スコア計算をスキップ: {item['name']} ({item['code']})")
             continue
         scored.append({
             "code": item["code"],
             "name": item["name"],
+            "sector": item.get("sector", ""),
             **result,
         })
 

@@ -163,6 +163,22 @@ def fetch_histories(stocks, period, min_rows, stage_label="データ取得",
 
 def get_nikkei_history():
     """
-    日経平均の履歴（相対強さの計算用）を取得する。失敗時は None。
+    日経平均の履歴を取得する。失敗時は None。
+    （注: 相対強さの基準には get_benchmark_history を使用。下記参照）
     """
     return _download_history("^N225", period="6mo")
+
+
+# 相対強さの「基準（ベンチマーク）」。
+# 日経平均(^N225)は yfinance で実勢とかけ離れた異常値を返すことがあるため、
+# 安定して取得できる TOPIX連動ETF(1306.T) を相対強さの基準に用いる。
+BENCHMARK_TICKER = "1306.T"
+BENCHMARK_NAME = "TOPIX(連動ETF)"
+
+
+def get_benchmark_history():
+    """
+    相対強さ計算の基準となるベンチマーク（TOPIX連動ETF）の履歴を取得する。
+    失敗時は None。
+    """
+    return _download_history(BENCHMARK_TICKER, period="6mo")

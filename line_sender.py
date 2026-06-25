@@ -96,12 +96,13 @@ def _batched(items, size):
         yield items[i:i + size]
 
 
-def send_report(report, token=None, user_id=None, timeout=30):
+def send_report(report, flex=None, token=None, user_id=None, timeout=30):
     """
     レポートをLINEへPush送信する。
 
     引数:
         report: 送信する本文（注意書きを含む完成済みレポート）
+        flex: (alt_text, contents) のタプル。指定すると先頭にFlexメッセージを送る。
         token / user_id: 明示指定が無ければ環境変数から取得
     戻り値:
         "sent"    : 送信成功
@@ -125,9 +126,15 @@ def send_report(report, token=None, user_id=None, timeout=30):
               "`pip install -r requirements.txt` を実行してください。")
         return "failed"
 
-    chunks = split_message(report)
-    if not chunks:
-        print("[LINE] 送信する本文が空のためスキップします。")
+    # 送信メッセージを組み立てる（Flexカード → テキスト本文の順）
+    messages = []
+    if flex is not None:
+        alt_text, contents = flex
+        messages.append({"type": "flex", "altText": alt_text, "contents": contents})
+    messages.extend({"type": "text", "text": c} for c in split_message(report))
+
+    if not messages:
+        print("[LINE] 送信する内容が空のためスキップします。")
         return "skipped"
 
     headers = {
@@ -135,21 +142,20 @@ def send_report(report, token=None, user_id=None, timeout=30):
         "Authorization": f"Bearer {token}",
     }
 
-    total_batches = (len(chunks) + MAX_MESSAGES_PER_REQUEST - 1) // MAX_MESSAGES_PER_REQUEST
-    print(f"[LINE] レポートを {len(chunks)} メッセージ"
-          f"（{total_batches} リクエスト）に分割して送信します...")
+    total_batches = (len(messages) + MAX_MESSAGES_PER_REQUEST - 1) // MAX_MESSAGES_PER_REQUEST
+    print(f"[LINE] {len(messages)} メッセージ"
+          f"（{total_batches} リクエスト）に分けて送信します...")
 
     all_ok = True
-    for bi, batch in enumerate(_batched(chunks, MAX_MESSAGES_PER_REQUEST), start=1):
-        messages = [{"type": "text", "text": c} for c in batch]
-        payload = {"to": user_id, "messages": messages}
+    for bi, batch in enumerate(_batched(messages, MAX_MESSAGES_PER_REQUEST), start=1):
+        payload = {"to": user_id, "messages": batch}
         try:
             resp = requests.post(
                 LINE_PUSH_ENDPOINT, headers=headers, json=payload, timeout=timeout
             )
             if resp.status_code == 200:
                 print(f"[LINE] バッチ {bi}/{total_batches} 送信成功"
-                      f"（{len(messages)} メッセージ）")
+                      f"（{len(batch)} メッセージ）")
             else:
                 all_ok = False
                 # 失敗してもプログラムは止めない。原因がわかるよう本文を表示。
