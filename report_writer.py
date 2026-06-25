@@ -82,29 +82,33 @@ def _chg(market, key):
 
 # ====== 市場概況・サマリー ======
 def format_market_section(market):
-    """市場概況セクションを文字列で返す。"""
-    lines = ["【市場概況】"]
+    """市場概況セクションを文字列で返す（3指標ずつインライン表示で圧縮）。"""
+    parts = []
     for name, data in market.items():
         price = data.get("price")
-        change = data.get("change_pct")
+        chg = data.get("change_pct")
         if price is None:
-            lines.append(f"  {name:<8} : 取得失敗")
+            parts.append(f"{name} 取得失敗")
+        elif chg is None:
+            parts.append(f"{name} {price:,.2f}")
         else:
-            lines.append(f"  {name:<8} : {price:>12,.2f}  （前日比 {_fmt_pct(change)}）")
+            parts.append(f"{name} {price:,.2f}({chg:+.2f}%)")
+    lines = ["【市場概況】"]
+    for i in range(0, len(parts), 3):
+        lines.append("  " + " ｜ ".join(parts[i:i + 3]))
     return "\n".join(lines)
 
 
 def format_stats_section(stats):
-    """スクリーニング結果サマリーのセクションを返す。"""
+    """スクリーニング結果サマリーのセクションを返す（1行に圧縮）。"""
     if not stats:
         return ""
-    lines = ["【スクリーニング結果サマリー】"]
-    lines.append(f"  分析対象銘柄数          : {stats.get('universe', 0)} 件")
-    lines.append(f"  一次データ取得成功数    : {stats.get('primary_fetched', 0)} 件")
-    lines.append(f"  一次スクリーニング通過数: {stats.get('primary_passed', 0)} 件")
-    lines.append(f"  二次データ取得成功数    : {stats.get('detail_fetched', 0)} 件")
-    lines.append(f"  最終注目銘柄数          : {stats.get('final', 0)} 件")
-    return "\n".join(lines)
+    return (
+        "【スクリーニング】"
+        f"対象 {stats.get('universe', 0):,} → 一次通過 {stats.get('primary_passed', 0)}"
+        f" → 最終 {stats.get('final', 0)} 件"
+        f"（取得: 一次{stats.get('primary_fetched', 0):,}/二次{stats.get('detail_fetched', 0)}）"
+    )
 
 
 # ====== #2 全体トレンド ======
@@ -205,11 +209,33 @@ def format_trend_section(market, scored_stocks, stats):
     return "\n".join(lines)
 
 
-# ====== #1 銘柄ごとの詳細解説 ======
-def _format_breakdown(details):
-    """6観点の獲得点を『観点 a/b』形式で2行に整形して返す。"""
-    parts = [f"{k} {details.get(k, 0):.1f}/{WEIGHTS[k]:.1f}" for k in _SCORE_ORDER]
-    return [" ｜ ".join(parts[:3]), " ｜ ".join(parts[3:])]
+# ====== #1 銘柄ごとの詳細解説（コンパクト表示） ======
+# スコア内訳の短縮ラベル（行を短く保つため）
+_SHORT_LABEL = {
+    "短期トレンド": "短期", "中期トレンド": "中期", "出来高": "出来高",
+    "相対強さ": "相対", "過熱回避": "過熱", "安定性": "安定",
+}
+
+
+def _breakdown_inline(details):
+    """6観点の獲得点を1行（観点a.a/満点）にまとめて返す。情報は省略しない。"""
+    return " ".join(
+        f"{_SHORT_LABEL[k]}{details.get(k, 0):.1f}/{WEIGHTS[k]:.1f}" for k in _SCORE_ORDER
+    )
+
+
+def _metrics_inline(m):
+    """テクニカル指標を1行にまとめて返す。"""
+    if not m:
+        return ""
+    return " / ".join([
+        f"5-25日{_fmt_signed(m.get('gap_5_25'))}",
+        f"25-75日{_fmt_signed(m.get('gap_25_75'))}",
+        f"出来高{_fmt_ratio(m.get('vol_ratio'))}",
+        f"対TOPIX{_fmt_signed(m.get('rel_strength'), 'pt')}",
+        f"5日{_fmt_signed(m.get('surge_5'))}",
+        f"ボラ{_fmt_plain(m.get('volatility'))}",
+    ])
 
 
 def _stock_comment(s):
@@ -235,54 +261,31 @@ def _stock_comment(s):
     return msg
 
 
-def _format_metrics(metrics):
-    """テクニカル指標の生値を3行に整形して返す。"""
-    if not metrics:
-        return []
-    return [
-        f"5日線−25日線: {_fmt_signed(metrics.get('gap_5_25'))}"
-        f"   25日線−75日線: {_fmt_signed(metrics.get('gap_25_75'))}",
-        f"出来高比(5日/25日): {_fmt_ratio(metrics.get('vol_ratio'))}"
-        f"   対TOPIX(20日): {_fmt_signed(metrics.get('rel_strength'), 'pt')}",
-        f"5日騰落: {_fmt_signed(metrics.get('surge_5'))}"
-        f"   日次ボラ: {_fmt_plain(metrics.get('volatility'))}",
-    ]
-
-
 def format_stock_section(scored_stocks):
-    """注目銘柄セクション（詳細版）を文字列で返す。"""
-    lines = ["【本日の注目銘柄 TOP{}】".format(len(scored_stocks))]
+    """
+    注目銘柄セクション（コンパクト版）を文字列で返す。
+    1銘柄6行で、内訳・指標・理由・リスク・総評の全情報を保持する。
+    （見出し凡例: 内訳=各観点 取得点/満点、指標の 5-25日=5日線が25日線を上回る割合 等）
+    """
+    lines = [
+        "【本日の注目銘柄 TOP{}】".format(len(scored_stocks)),
+        "（内訳=取得点/満点 ｜ 指標 5-25日/25-75日=移動平均かい離, 対TOPIX=20日相対pt, ボラ=日次）",
+    ]
     for rank, s in enumerate(scored_stocks, start=1):
         sector = s.get("sector", "")
-        sector_str = f"   業種: {sector}" if sector else ""
+        sec = f"・{sector}" if sector else ""
         lines.append("")
-        lines.append(f"─── 第{rank}位 ────────────────────────────────")
-        lines.append(f"  銘柄名     : {s['name']}（{s['code']}）{sector_str}")
-        lines.append(f"  現在株価   : {_fmt_price(s['price'])} 円")
         lines.append(
-            f"  評価点     : {s['score']:.1f} / 10.0    "
-            f"想定上昇率 {_fmt_pct(s['expected_up_pct'])}"
+            f"■{rank}位 {s['name']}({s['code']}){sec}  "
+            f"{_fmt_price(s['price'])}円｜評価{s['score']:.1f}/10｜想定{_fmt_pct(s['expected_up_pct'])}"
         )
-
-        lines.append("  ▼ スコア内訳（各観点の獲得点）")
-        for bl in _format_breakdown(s.get("details", {})):
-            lines.append(f"      {bl}")
-
-        metric_lines = _format_metrics(s.get("metrics", {}))
-        if metric_lines:
-            lines.append("  ▼ テクニカル指標")
-            for ml in metric_lines:
-                lines.append(f"      {ml}")
-
-        lines.append("  ▼ 注目理由")
-        for r in s["reasons"]:
-            lines.append(f"      ・{r}")
-        lines.append("  ▼ リスク")
-        for risk in s["risks"]:
-            lines.append(f"      ・{risk}")
-
-        lines.append("  ▼ 総合コメント")
-        lines.append(f"      {_stock_comment(s)}")
+        lines.append(f"  内訳 {_breakdown_inline(s.get('details', {}))}")
+        metrics = _metrics_inline(s.get("metrics", {}))
+        if metrics:
+            lines.append(f"  指標 {metrics}")
+        lines.append(f"  理由 {'／'.join(s['reasons'])}")
+        lines.append(f"  リスク {'／'.join(s['risks'])}")
+        lines.append(f"  総評 {_stock_comment(s)}")
     return "\n".join(lines)
 
 
@@ -290,14 +293,9 @@ def build_report(market, scored_stocks, stats=None):
     """
     レポート全文を組み立てて返す（ターミナル表示・LINEテキスト用）。
     """
-    now = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+    now = datetime.now().strftime("%Y/%m/%d %H:%M")
 
-    header = (
-        "============================================================\n"
-        "       毎朝の日本株 AIレポート（東証スクリーニング版）\n"
-        f"       生成日時: {now}\n"
-        "============================================================"
-    )
+    header = f"■ 日本株 AIレポート（東証スクリーニング版）  {now}"
 
     parts = [header, "", format_market_section(market)]
 
@@ -320,9 +318,7 @@ def build_report(market, scored_stocks, stats=None):
         parts.append("  ネットワーク接続や銘柄一覧をご確認ください。")
 
     parts.append("")
-    parts.append("------------------------------------------------------------")
     parts.append(DISCLAIMER)
-    parts.append("------------------------------------------------------------")
 
     return "\n".join(parts)
 
