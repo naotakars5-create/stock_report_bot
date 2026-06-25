@@ -3,4 +3,6 @@ pandas>=2.0.0
 requests>=2.28.0
 python-dotenv>=1.0.0
 xlrd>=2.0.1
+# 補助スクリプト get_line_user_id.py 用（本番の毎朝レポートでは未使用）
+flask>=3.0.0
 
