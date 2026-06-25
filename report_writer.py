@@ -289,9 +289,25 @@ def format_stock_section(scored_stocks):
     return "\n".join(lines)
 
 
-def build_report(market, scored_stocks, stats=None):
+def format_stock_list_oneline(scored_stocks):
+    """注目銘柄を1銘柄1行に圧縮した一覧（詳細はカード参照の前提）。"""
+    lines = [f"【本日の注目銘柄 TOP{len(scored_stocks)}】（詳しい評価は各銘柄カードを参照）"]
+    for rank, s in enumerate(scored_stocks, start=1):
+        sector = s.get("sector", "")
+        sec = f"・{sector}" if sector else ""
+        lines.append(
+            f"  {rank}. {s['name']}({s['code']}){sec}  "
+            f"{s['score']:.1f}/10  想定{_fmt_pct(s['expected_up_pct'])}"
+        )
+    return "\n".join(lines)
+
+
+def build_report(market, scored_stocks, stats=None, detailed=True):
     """
-    レポート全文を組み立てて返す（ターミナル表示・LINEテキスト用）。
+    レポート全文を組み立てて返す。
+
+    detailed=True : 各銘柄を詳細表示（ターミナル向け）
+    detailed=False: 各銘柄は1行に圧縮（LINE向け。詳細はFlexカードで配信するため）
     """
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
 
@@ -310,7 +326,10 @@ def build_report(market, scored_stocks, stats=None):
 
     if scored_stocks:
         parts.append("")
-        parts.append(format_stock_section(scored_stocks))
+        parts.append(
+            format_stock_section(scored_stocks) if detailed
+            else format_stock_list_oneline(scored_stocks)
+        )
     else:
         parts.append("")
         parts.append("【本日の注目銘柄】")
@@ -421,3 +440,119 @@ def build_flex_message(market, scored_stocks, stats=None, now_str=None):
               "header": header, "body": body, "footer": footer}
     alt = f"本日の注目銘柄 TOP{len(scored_stocks)}（{now_str}）"
     return alt, bubble
+
+
+# ====== 銘柄ごとの「評価カード」（カルーセル：スコアをバーで可視化） ======
+_C_AMBER = "#F5A623"
+
+
+def _bar_color(ratio):
+    """獲得割合に応じてバー色を変える（強い=緑/中位=橙/弱い=赤）。"""
+    if ratio >= 0.7:
+        return _C_UP
+    if ratio >= 0.4:
+        return _C_AMBER
+    return _C_DOWN
+
+
+def _flex_score_bar(label, val, maxv):
+    """1観点のスコアを『ラベル｜横棒グラフ｜数値』の1行にして返す。"""
+    ratio = (val / maxv) if maxv else 0.0
+    pct = max(3, min(100, round(ratio * 100)))  # 0%でも細く見えるよう下限3%
+    bar = {
+        "type": "box", "layout": "vertical", "height": "8px",
+        "backgroundColor": "#E8E8E8", "cornerRadius": "4px", "contents": [
+            {"type": "box", "layout": "vertical", "height": "8px",
+             "width": f"{pct}%", "backgroundColor": _bar_color(ratio),
+             "cornerRadius": "4px", "contents": [{"type": "filler"}]},
+        ],
+    }
+    return {
+        "type": "box", "layout": "horizontal", "alignItems": "center",
+        "spacing": "sm", "contents": [
+            _flex_text(label, flex=3, size="xs", color="#666666"),
+            {"type": "box", "layout": "vertical", "flex": 6, "contents": [bar]},
+            _flex_text(f"{val:.1f}/{maxv:g}", flex=3, size="xs",
+                       align="end", color="#333333"),
+        ],
+    }
+
+
+def build_detail_bubble(rank, s):
+    """1銘柄の詳細評価カード（bubble）を作る。"""
+    up = s["expected_up_pct"]
+    sector = s.get("sector", "")
+    sec = f"・{sector}" if sector else ""
+
+    header = {
+        "type": "box", "layout": "vertical", "backgroundColor": "#0B3D91",
+        "paddingAll": "12px", "contents": [
+            {"type": "box", "layout": "horizontal", "alignItems": "center",
+             "contents": [
+                 _flex_text(f"第{rank}位", color="#C5D2F0", size="sm", flex=4,
+                            gravity="center"),
+                 _flex_text(f"{s['score']:.1f}/10", color="#FFFFFF", size="xl",
+                            weight="bold", align="end", flex=6),
+             ]},
+            _flex_text(f"{s['name']}({s['code']}){sec}", color="#FFFFFF",
+                       size="md", weight="bold", wrap=True, margin="sm"),
+        ],
+    }
+
+    body_contents = [
+        {"type": "box", "layout": "horizontal", "contents": [
+            _flex_text(f"株価 {_fmt_price(s['price'])}円", size="sm",
+                       color="#333333", flex=6),
+            _flex_text(f"想定 {up:+.1f}%", size="sm", weight="bold",
+                       align="end", color=_color_of(up), flex=4),
+        ]},
+        {"type": "separator", "margin": "md"},
+        _flex_text("スコア内訳（取得点/満点）", size="xs", color="#888888", margin="md"),
+    ]
+    details = s.get("details", {})
+    for k in _SCORE_ORDER:
+        body_contents.append(_flex_score_bar(_SHORT_LABEL[k], details.get(k, 0), WEIGHTS[k]))
+
+    metrics = _metrics_inline(s.get("metrics", {}))
+    if metrics:
+        body_contents.append({"type": "separator", "margin": "md"})
+        body_contents.append(_flex_text("テクニカル指標", size="xs", color="#888888", margin="md"))
+        body_contents.append(_flex_text(metrics, size="xs", color="#333333", wrap=True))
+
+    body_contents.append({"type": "separator", "margin": "md"})
+    body_contents.append(_flex_text("注目理由", size="xs", color="#888888", margin="md"))
+    for r in s["reasons"]:
+        body_contents.append(_flex_text("・" + r, size="xs", color="#1A7F37", wrap=True))
+    body_contents.append(_flex_text("リスク", size="xs", color="#888888", margin="md"))
+    for r in s["risks"]:
+        body_contents.append(_flex_text("・" + r, size="xs", color="#B3261E", wrap=True))
+
+    body_contents.append({"type": "separator", "margin": "md"})
+    body_contents.append(_flex_text(_stock_comment(s), size="xs", color="#555555", wrap=True))
+
+    body = {"type": "box", "layout": "vertical", "paddingAll": "12px",
+            "spacing": "sm", "contents": body_contents}
+    return {"type": "bubble", "size": "mega", "header": header, "body": body}
+
+
+def build_detail_carousels(scored_stocks, per_carousel=6):
+    """
+    注目銘柄の詳細評価カードを、LINEのサイズ上限(50KB/メッセージ)に収まるよう
+    複数のカルーセル（横スワイプ）に分割して返す。
+
+    1カードが約6KBあり、10枚だと1カルーセルで50KBを超えるため、
+    既定では per_carousel=6 枚ずつに分ける。
+
+    戻り値:
+        [(alt_text, contents), ...]  銘柄が無ければ []。
+    """
+    if not scored_stocks:
+        return []
+    stocks = scored_stocks[:12]
+    carousels = []
+    for start in range(0, len(stocks), per_carousel):
+        chunk = stocks[start:start + per_carousel]
+        bubbles = [build_detail_bubble(start + i + 1, s) for i, s in enumerate(chunk)]
+        alt = f"注目銘柄の詳細評価カード（{start + 1}〜{start + len(chunk)}位・横スワイプ）"
+        carousels.append((alt, {"type": "carousel", "contents": bubbles}))
+    return carousels

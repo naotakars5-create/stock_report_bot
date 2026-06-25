@@ -128,23 +128,27 @@ def main():
     )
     stats["final"] = len(scored_stocks)
 
-    # 5. レポート出力（ターミナル表示＋LINE送信：Flexカード＋テキスト）
-    report = report_writer.build_report(market, scored_stocks, stats)
-    flex = report_writer.build_flex_message(market, scored_stocks, stats)
+    # 5. レポート出力
+    #    - ターミナルには詳細テキスト
+    #    - LINEには「短縮テキスト＋まとめカード＋銘柄別の詳細カード（カルーセル）」
+    report_full = report_writer.build_report(market, scored_stocks, stats, detailed=True)
+    report_line = report_writer.build_report(market, scored_stocks, stats, detailed=False)
+    flex_messages = [report_writer.build_flex_message(market, scored_stocks, stats)]
+    flex_messages.extend(report_writer.build_detail_carousels(scored_stocks))
     print()
-    print(report)
-    _deliver(report, flex)
+    print(report_full)
+    _deliver(report_line, flex_messages)
 
     return 0
 
 
-def _deliver(report, flex=None):
+def _deliver(report, flex_messages=None):
     """
-    レポートをLINEへ送信する（Flexカード＋テキスト本文）。
+    レポートをLINEへ送信する（まとめカード＋銘柄別の詳細カード＋テキスト本文）。
     環境変数が未設定ならスキップ、失敗しても全体は止めない。
     """
     try:
-        line_sender.send_report(report, flex=flex)
+        line_sender.send_report(report, flex_messages=flex_messages)
     except Exception as e:
         print(f"[警告] LINE送信処理で予期せぬエラー（処理は継続）: {e}")
 

@@ -96,13 +96,14 @@ def _batched(items, size):
         yield items[i:i + size]
 
 
-def send_report(report, flex=None, token=None, user_id=None, timeout=30):
+def send_report(report, flex_messages=None, token=None, user_id=None, timeout=30):
     """
     レポートをLINEへPush送信する。
 
     引数:
         report: 送信する本文（注意書きを含む完成済みレポート）
-        flex: (alt_text, contents) のタプル。指定すると先頭にFlexメッセージを送る。
+        flex_messages: [(alt_text, contents), ...] のリスト。指定すると先頭に
+                       Flexメッセージ（まとめカード・詳細カルーセル等）を順に送る。
         token / user_id: 明示指定が無ければ環境変数から取得
     戻り値:
         "sent"    : 送信成功
@@ -128,8 +129,8 @@ def send_report(report, flex=None, token=None, user_id=None, timeout=30):
 
     # 送信メッセージを組み立てる（Flexカード → テキスト本文の順）
     messages = []
-    if flex is not None:
-        alt_text, contents = flex
+    for fm in (flex_messages or []):
+        alt_text, contents = fm
         messages.append({"type": "flex", "altText": alt_text, "contents": contents})
     messages.extend({"type": "text", "text": c} for c in split_message(report))
 
