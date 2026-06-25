@@ -1,0 +1,36 @@
+name: Daily Stock Report
+
+# 毎朝7:00（日本時間 JST）に自動実行する。
+# GitHub Actions の cron は UTC で指定するため、JST 07:00 = UTC 22:00（前日）。
+# 手動実行(workflow_dispatch)も可能。
+on:
+  schedule:
+    - cron: "0 22 * * *"   # 22:00 UTC = 翌日 07:00 JST
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    # 全銘柄版は一次スクリーニングのデータ取得に時間がかかるため余裕を持たせる
+    timeout-minutes: 60
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      - name: レポート生成＆LINE送信
+        # Secrets から認証情報を環境変数として渡す。
+        # 未設定の場合でも main.py 側でスキップされ、処理は止まらない。
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: python main.py
