@@ -2,7 +2,7 @@
 
 東証上場銘柄を**機械的な条件でスクリーニング**し、出来高・移動平均・相対強度・過熱感
 などから「**今日見るべき銘柄**」を整理して、朝の情報整理に使うためのレポートです。
-ターミナルに出力 ＋ **LINEへ自動送信**し、**GitHub Actions で毎朝7:00（日本時間）に自動実行**できます。
+ターミナルに出力 ＋ **LINEへ自動送信**し、**GitHub Actions で平日（月〜金）の朝7:03（日本時間）に自動実行**できます（土日は配信しません）。
 銘柄一覧は **JPX公式の上場銘柄一覧(`data_j.xls`)を起動時に自動取得**するため、
 手動でのCSV差し替えは不要です（取得に失敗しても既存CSVで継続します）。
 
@@ -246,7 +246,7 @@ $env:MAX_STOCKS = "all"; python main.py   # none / 0 でも全銘柄
 | `data/report_history.csv` | スクリーニング結果の履歴（前回検証用）。実行時に自動生成・追記 |
 | `stocks.csv` | （旧MVP版の30銘柄リスト。現在は未使用・参考） |
 | `.env.example` | LINE認証情報のテンプレート（`.env` にコピーして使う） |
-| `.github/workflows/daily_report.yml` | GitHub Actions（毎朝7:00 JST 自動実行） |
+| `.github/workflows/daily_report.yml` | GitHub Actions（平日 月〜金の朝7:03 JST 自動実行） |
 | `requirements.txt` | 依存ライブラリ |
 | `README.md` | 本ファイル |
 
@@ -579,14 +579,15 @@ LINE_USER_ID=（手順3のU...から始まるID）
 
 ---
 
-## 毎朝の自動実行（GitHub Actions）
+## 平日朝の自動実行（GitHub Actions）
 
-`.github/workflows/daily_report.yml` により、**毎朝7:00（日本時間）に自動実行**されます。
+`.github/workflows/daily_report.yml` により、**平日（月〜金）の朝7:03（日本時間）に自動実行**されます（土日は配信しません）。
 
 ### 仕組み
 
 - GitHub Actions の `schedule` (cron) でジョブを起動します。
-- cron は **UTC** で指定するため、`0 22 * * *`（UTC 22:00）＝ **翌日 JST 07:00** としています。
+- cron は **UTC** で指定するため、`3 22 * * 0-4`（UTC 22:03・日〜木）＝ **翌日 JST 07:03・月〜金** としています。
+  （cron の曜日も UTC 基準なので、「UTC 日〜木」が「JST 月〜金」に対応します。）
 - ジョブ内で Python をセットアップ →依存インストール → `python main.py` を実行します。
 - LINE認証情報は **GitHub Secrets** から環境変数として渡します。
 - 手動でも実行できます（Actionsタブ →「Daily Stock Report」→「Run workflow」）。
@@ -613,8 +614,9 @@ LINE_USER_ID=（手順3のU...から始まるID）
 ```yaml
 on:
   schedule:
-    - cron: "0 22 * * *"   # JST 07:00（既定）
-    # - cron: "30 21 * * *" # JST 06:30 にしたい場合
+    - cron: "3 22 * * 0-4"   # JST 月〜金 07:03（既定・土日は配信しない）
+    # - cron: "3 22 * * *"   # 毎日 JST 07:03 にしたい場合
+    # - cron: "33 21 * * 0-4" # 平日 JST 06:33 にしたい場合
 ```
 
 ---
@@ -632,7 +634,7 @@ python main.py
 
 ### GitHub Actions での実行
 
-- **自動**: 毎朝7:00 JSTに起動（Secrets設定済みであればLINEへ届く）。
+- **自動**: 平日（月〜金）の朝7:03 JSTに起動（Secrets設定済みであればLINEへ届く。土日は配信しない）。
 - **手動**: リポジトリの **Actions** タブ →「Daily Stock Report」→「Run workflow」。
 
 ---
