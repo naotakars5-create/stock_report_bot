@@ -4,31 +4,34 @@ stock_scorer.py
 取得した株価データ等から、各銘柄に 0.0〜10.0 点の評価点をつけるモジュール。
 
 評価軸と配点（合計 10.0）:
-  1. トレンド評価          : 2.0  （5日・25日・75日移動平均の並び、株価との位置）
-  2. 出来高・流動性評価    : 1.5  （出来高増加率、売買代金による流動性）
-  3. 相対強度評価          : 1.5  （市場平均(TOPIX連動ETF)に対する強さ）
-  4. 業種テーマ性評価      : 1.5  （半導体/防衛/AI等のテーマタグ）
-  5. バリュエーション評価  : 1.0  （PER/PBR/配当利回り。取得できなければ中立）
-  6. 安定性・過熱回避      : 1.5  （急騰しすぎ・高ボラのペナルティ）
-  7. 前回検証・継続性補正  : 1.0  （前回上位の継続性。過熱が強ければ減点）
+  1. トレンド評価          : 1.7  （5日・25日・75日移動平均の並び、株価との位置）
+  2. 出来高・流動性評価    : 1.3  （出来高増加率、売買代金による流動性）
+  3. 相対強度評価          : 1.3  （市場平均(TOPIX連動ETF)に対する強さ）
+  4. 業種テーマ性評価      : 1.3  （半導体/防衛/AI等のテーマタグ）
+  5. ニュース環境・マクロ  : 1.0  （世界情勢・経済ニュースと銘柄テーマの関連）
+  6. バリュエーション評価  : 0.9  （PER/PBR/配当利回り。取得できなければ中立）
+  7. 安定性・過熱回避      : 1.3  （急騰しすぎ・高ボラのペナルティ）
+  8. 前回検証・継続性補正  : 1.2  （前回上位の継続性。過熱が強ければ減点）
 
 注意: これは「売買推奨」ではなく、公開データに基づく機械的なスクリーニングです。
 """
 
 import pandas as pd
 
+import macro_analyzer
 from profile_loader import HIGH_ATTENTION_THEMES
 
 
 # 各評価軸の配点（合計 = 10.0）
 WEIGHTS = {
-    "トレンド": 2.0,
-    "出来高": 1.5,
-    "相対強度": 1.5,
-    "テーマ性": 1.5,
-    "割安感": 1.0,
-    "安定性": 1.5,
-    "継続性": 1.0,
+    "トレンド": 1.7,
+    "出来高": 1.3,
+    "相対強度": 1.3,
+    "テーマ性": 1.3,
+    "ニュース": 1.0,
+    "割安感": 0.9,
+    "安定性": 1.3,
+    "継続性": 1.2,
 }
 MAX_RAW = sum(WEIGHTS.values())  # 10.0
 
@@ -174,9 +177,9 @@ def _size_from_mktcap(valuation):
 
 # ====== 二次スクリーニング（評価点 0〜10） ======
 def score_stock(history, benchmark_close=None, theme_tags=None,
-                valuation=None, continuity=None):
+                valuation=None, continuity=None, news_ratio=None, news_line=None):
     """
-    1銘柄を 7つの評価軸でスコアリングする。
+    1銘柄を 8つの評価軸でスコアリングする。
 
     引数:
         history: yfinance の OHLCV DataFrame
@@ -184,6 +187,8 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
         theme_tags: 業種テーマ性評価に使うテーマタグのリスト
         valuation: {"per","pbr","div_yield","market_cap"}（取得不可なら None で中立）
         continuity: {"in_previous": bool}（前回上位かどうか。None で中立）
+        news_ratio: ニュース環境評価(0〜1)。None で中立(0.5)
+        news_line: ニュース環境の説明文（評価理由・カード表示に使う）
 
     戻り値: dict（score/price/reasons/risks/details/metrics 等）。計算不可なら None。
     注意: これは売買推奨ではなく、機械的なスクリーニング評価です。
@@ -264,10 +269,18 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
     if theme_tags:
         reasons.append("テーマ性: " + "・".join(theme_tags[:3]))
 
-    # 5. バリュエーション評価（取得不可は中立）
+    # 5. ニュース環境・マクロテーマ評価（世界情勢・経済ニュースとの関連。中立は0.5）
+    nr = 0.5 if news_ratio is None else _clamp(news_ratio)
+    details["ニュース"] = nr * WEIGHTS["ニュース"]
+    if news_ratio is not None and news_ratio >= 0.65:
+        reasons.append("ニュース環境: " + (news_line or "関連テーマが意識されやすい環境"))
+    elif news_ratio is not None and news_ratio <= 0.4:
+        risks.append("ニュース環境: " + (news_line or "関連テーマに逆風の可能性に注意"))
+
+    # 6. バリュエーション評価（取得不可は中立）
     details["割安感"] = _valuation_ratio(valuation) * WEIGHTS["割安感"]
 
-    # 6. 安定性・過熱回避
+    # 7. 安定性・過熱回避
     surge_5 = _pct_change(close, 5)
     vol_pct = _daily_volatility(close, 20)
     oh = 0.5 if surge_5 is None else (1.0 if surge_5 <= 0 else _clamp(1 - surge_5 / 15))
@@ -283,7 +296,7 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
     if size == "小型":
         risks.append("小型株のため値動きが大きくなりやすい")
 
-    # 7. 前回検証・継続性補正
+    # 8. 前回検証・継続性補正
     if continuity is None or not continuity.get("in_previous"):
         details["継続性"] = 0.5 * WEIGHTS["継続性"]
     else:
@@ -311,6 +324,7 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
         "pbr": (valuation or {}).get("pbr"),
         "div_yield": (valuation or {}).get("div_yield"),
         "market_cap": (valuation or {}).get("market_cap"),
+        "news_ratio": nr,
         "sma5": sma5, "sma25": sma25, "sma75": sma75,
     }
 
@@ -322,12 +336,13 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
         "details": details,
         "metrics": metrics,
         "theme_tags": theme_tags,
+        "news_line": news_line,
         "size_category": size,
     }
 
 
 def score_all(stock_histories, benchmark_df=None, top_n=5,
-              profiles=None, valuations=None, previous_codes=None):
+              profiles=None, valuations=None, previous_codes=None, macro_context=None):
     """
     全候補銘柄をスコアリングし、評価点 MIN_FINAL_SCORE 以上の上位 top_n 件を返す。
 
@@ -335,6 +350,7 @@ def score_all(stock_histories, benchmark_df=None, top_n=5,
         profiles: {code: profile}（profile_loader 由来。theme_tags/business_summary を含む）
         valuations: {code: valuation}（data_fetcher.get_valuation の結果）
         previous_codes: 前回上位の証券コード集合（継続性補正に使用）
+        macro_context: macro_analyzer.analyze の結果（ニュース環境評価に使用。None で中立）
     """
     benchmark_close = None
     if benchmark_df is not None and "Close" in benchmark_df:
@@ -347,12 +363,18 @@ def score_all(stock_histories, benchmark_df=None, top_n=5,
     for item in stock_histories:
         code = item["code"]
         prof = profiles.get(code) or {}
+        tags = prof.get("theme_tags") or []
+        # ニュース環境（macro_context が無ければ中立）
+        news_ratio = macro_analyzer.stock_news_ratio(macro_context, tags) if macro_context else None
+        news_line = macro_analyzer.stock_news_line(macro_context, tags) if macro_context else None
         result = score_stock(
             item["history"],
             benchmark_close=benchmark_close,
-            theme_tags=prof.get("theme_tags") or [],
+            theme_tags=tags,
             valuation=valuations.get(code),
             continuity={"in_previous": code in previous_codes},
+            news_ratio=news_ratio,
+            news_line=news_line,
         )
         if result is None:
             print(f"[警告] スコア計算をスキップ: {item['name']} ({code})")

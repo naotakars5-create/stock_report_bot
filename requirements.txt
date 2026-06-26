@@ -1,5 +1,7 @@
 yfinance>=0.2.40
 pandas>=2.0.0
+# requests はニュース取得(news_fetcher.py)にも使用。RSSの解析は標準ライブラリ
+# (xml.etree)で行うため、ニュース機能に追加ライブラリ・APIキーは不要。
 requests>=2.28.0
 python-dotenv>=1.0.0
 xlrd>=2.0.1

@@ -33,6 +33,8 @@ import universe_loader
 import jpx_fetcher
 import data_fetcher
 import profile_loader
+import news_fetcher
+import macro_analyzer
 import stock_scorer
 import report_writer
 import report_history
@@ -135,6 +137,20 @@ def main():
         print(f"[警告] 市場データの取得で予期せぬエラー: {e}")
         market = {}
 
+    # 1.5 世界情勢・経済ニュースの取得とマクロ分析
+    #     失敗してもスクリーニングは止めず、ニュース評価は中立扱いにする。
+    print("\n■ 世界情勢・経済ニュースの取得")
+    try:
+        headlines = news_fetcher.fetch_headlines()
+    except Exception as e:
+        print(f"[警告] ニュース取得で予期せぬエラー（ニュース評価は中立）: {e}")
+        headlines = []
+    macro_context = macro_analyzer.analyze(headlines, market)
+    if macro_context.get("summary_themes"):
+        print(f"  主要テーマ: {' / '.join(macro_context['summary_themes'])}")
+    if not macro_context.get("available"):
+        print("[情報] ニュース取得が一部制限されています（ニュース評価は中立扱い）。")
+
     # 2. 市場平均(TOPIX連動ETF)の履歴（相対強度の基準）
     benchmark_df = data_fetcher.get_benchmark_history()
     if benchmark_df is None:
@@ -185,6 +201,7 @@ def main():
         scored_stocks = stock_scorer.score_all(
             detail_histories, benchmark_df=benchmark_df, top_n=FINAL_TOP_N,
             profiles=profiles_map, valuations=valuations, previous_codes=previous_codes,
+            macro_context=macro_context,
         )
     else:
         print("[情報] 一次スクリーニングを通過した銘柄はありませんでした。")
@@ -199,11 +216,13 @@ def main():
     # 6. レポート出力
     #    LINE送信順: (1)全体サマリーカード → (2)上位5銘柄の横スライドカード
     #              → (3)詳細テキストレポート
-    report = report_writer.build_report(market, scored_stocks, stats, validation=validation)
+    report = report_writer.build_report(
+        market, scored_stocks, stats, validation=validation, macro_context=macro_context)
     flex_messages = [
-        report_writer.build_flex_message(market, scored_stocks, stats, validation=validation)
+        report_writer.build_flex_message(
+            market, scored_stocks, stats, validation=validation, macro_context=macro_context)
     ]
-    cards = report_writer.build_stock_cards(scored_stocks)
+    cards = report_writer.build_stock_cards(scored_stocks, macro_context=macro_context)
     if cards:
         flex_messages.append(cards)
     print()
