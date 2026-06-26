@@ -182,3 +182,46 @@ def get_benchmark_history():
     失敗時は None。
     """
     return _download_history(BENCHMARK_TICKER, period="6mo")
+
+
+def get_valuation(ticker):
+    """
+    PER/PBR/配当利回り/時価総額を best-effort で取得する。
+
+    yfinance の .info / .fast_info は失敗・欠損が多いため、取得できない項目は
+    None のままにして全体を止めない（バリュエーション評価はニュートラル扱いになる）。
+
+    戻り値: {"per", "pbr", "div_yield"(%), "market_cap"}
+    """
+    out = {"per": None, "pbr": None, "div_yield": None, "market_cap": None}
+    try:
+        t = yf.Ticker(ticker)
+        # 時価総額は fast_info の方が軽量・安定
+        try:
+            fi = t.fast_info
+            mc = getattr(fi, "market_cap", None)
+            if mc is None and isinstance(fi, dict):
+                mc = fi.get("market_cap")
+            out["market_cap"] = float(mc) if mc else None
+        except Exception:
+            pass
+
+        info = {}
+        try:
+            info = t.info or {}
+        except Exception:
+            info = {}
+
+        per = info.get("trailingPE") or info.get("forwardPE")
+        pbr = info.get("priceToBook")
+        dy = info.get("dividendYield")
+        out["per"] = float(per) if per else None
+        out["pbr"] = float(pbr) if pbr else None
+        if dy:
+            # yfinance は割合(0.025)とパーセント(2.5)が混在するため正規化
+            out["div_yield"] = float(dy) * 100 if dy < 1 else float(dy)
+        if out["market_cap"] is None and info.get("marketCap"):
+            out["market_cap"] = float(info["marketCap"])
+    except Exception as e:
+        print(f"[警告] バリュエーション取得に失敗 ({ticker}): {e}")
+    return out

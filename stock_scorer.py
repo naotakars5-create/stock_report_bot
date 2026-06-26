@@ -1,65 +1,50 @@
 """
 stock_scorer.py
 
-取得した株価データから、各銘柄に 0.0〜10.0 点の評価点をつけるモジュール。
+取得した株価データ等から、各銘柄に 0.0〜10.0 点の評価点をつけるモジュール。
 
-スコアリング観点（各観点に配点を割り当て、合計を 10 点満点に正規化）:
-  1. 5日移動平均と25日移動平均の関係（短期トレンド）
-  2. 25日移動平均と75日移動平均の関係（中期トレンド）
-  3. 直近出来高が平均出来高より増えているか（人気・関心）
-  4. 市場平均(TOPIX連動ETF)に対して相対的に強いか（相対強さ）
-  5. 直近で急騰しすぎていないか（過熱の回避）
-  6. ボラティリティが高すぎないか（安定性）
+評価軸と配点（合計 10.0）:
+  1. トレンド評価          : 2.0  （5日・25日・75日移動平均の並び、株価との位置）
+  2. 出来高・流動性評価    : 1.5  （出来高増加率、売買代金による流動性）
+  3. 相対強度評価          : 1.5  （市場平均(TOPIX連動ETF)に対する強さ）
+  4. 業種テーマ性評価      : 1.5  （半導体/防衛/AI等のテーマタグ）
+  5. バリュエーション評価  : 1.0  （PER/PBR/配当利回り。取得できなければ中立）
+  6. 安定性・過熱回避      : 1.5  （急騰しすぎ・高ボラのペナルティ）
+  7. 前回検証・継続性補正  : 1.0  （前回上位の継続性。過熱が強ければ減点）
 
-注意: これは投資助言ではなく、機械的なスクリーニングです。
+注意: これは「売買推奨」ではなく、公開データに基づく機械的なスクリーニングです。
 """
 
 import pandas as pd
 
+from profile_loader import HIGH_ATTENTION_THEMES
 
-# 各観点の配点（合計 = 満点）
+
+# 各評価軸の配点（合計 = 10.0）
 WEIGHTS = {
-    "短期トレンド": 2.0,    # 5日 vs 25日
-    "中期トレンド": 2.0,    # 25日 vs 75日
-    "出来高": 1.5,          # 出来高増加
-    "相対強さ": 2.0,        # 対 市場平均(TOPIX連動ETF)
-    "過熱回避": 1.5,        # 短期の過熱感
-    "安定性": 1.0,          # ボラティリティ
+    "トレンド": 2.0,
+    "出来高": 1.5,
+    "相対強度": 1.5,
+    "テーマ性": 1.5,
+    "割安感": 1.0,
+    "安定性": 1.5,
+    "継続性": 1.0,
 }
 MAX_RAW = sum(WEIGHTS.values())  # 10.0
 
 # 最終抽出の評価点の下限（これ未満は「今回は除外」）
 MIN_FINAL_SCORE = 6.0
 
-
 # 一次スクリーニングの既定パラメータ
 PRIMARY_MIN_AVG_VOLUME = 50000   # 直近20日平均出来高の下限（流動性フィルタ）
 PRIMARY_MAX_SURGE_5D = 20.0      # 直近5日の上昇率がこれを超えたら過熱とみなす
 
 
+# ====== 一次スクリーニング（軽量・高速） ======
 def primary_screen(history, min_avg_volume=PRIMARY_MIN_AVG_VOLUME):
-    """
-    一次スクリーニング（軽量・高速）。
-
-    判定条件:
-        - 流動性: 直近20日の平均出来高が一定以上
-        - 25日移動平均より株価が上にある
-        - 5日移動平均が25日移動平均を上回っている
-        - 直近出来高が増えている（5日平均 > 25日平均）
-        - 急騰しすぎていない（直近5日の上昇率が閾値未満）
-
-    戻り値:
-        {
-          "passed": bool,           # 全条件を満たしたか
-          "primary_score": float,   # 通過銘柄を並べ替えるための簡易スコア
-          "price": float,
-          "avg_volume": float,
-        }
-        計算に必要なデータが無ければ None。
-    """
+    """一次スクリーニング。全条件を満たすか判定し、並べ替え用スコアを返す。"""
     close = history["Close"].dropna()
     volume = history["Volume"].dropna() if "Volume" in history else pd.Series(dtype=float)
-
     if len(close) < 25:
         return None
 
@@ -69,13 +54,11 @@ def primary_screen(history, min_avg_volume=PRIMARY_MIN_AVG_VOLUME):
     if sma5 is None or sma25 is None or sma25 == 0:
         return None
 
-    # 流動性（直近20日平均出来高）
     avg_volume = None
     if len(volume) >= 20:
         avg_volume = float(volume.rolling(20).mean().iloc[-1])
     liquidity_ok = avg_volume is not None and avg_volume >= min_avg_volume
 
-    # 各条件
     above_25ma = price > sma25
     short_up = sma5 > sma25
 
@@ -93,7 +76,6 @@ def primary_screen(history, min_avg_volume=PRIMARY_MIN_AVG_VOLUME):
 
     passed = bool(liquidity_ok and above_25ma and short_up and vol_up and not_overheated)
 
-    # 通過銘柄の並べ替え用スコア（高いほど一次評価が良い）
     above_pct = (price - sma25) / sma25 * 100
     gap_pct = (sma5 - sma25) / sma25 * 100
     momentum = surge5 if surge5 is not None else 0.0
@@ -101,7 +83,7 @@ def primary_screen(history, min_avg_volume=PRIMARY_MIN_AVG_VOLUME):
         above_pct * 0.3
         + gap_pct * 0.4
         + (vol_ratio - 1.0) * 100 * 0.2
-        - max(0.0, momentum - 10.0) * 0.5  # 過熱はマイナス
+        - max(0.0, momentum - 10.0) * 0.5
     )
 
     return {
@@ -112,17 +94,8 @@ def primary_screen(history, min_avg_volume=PRIMARY_MIN_AVG_VOLUME):
     }
 
 
-def screen_primary(stock_histories, min_avg_volume=PRIMARY_MIN_AVG_VOLUME,
-                   top_n=50):
-    """
-    一次スクリーニングを全銘柄に適用し、通過銘柄を primary_score 降順で返す。
-
-    引数:
-        stock_histories: fetch_histories の戻り値（"history" を含む）
-    戻り値:
-        通過銘柄リスト（上位 top_n 件）。各要素は元の銘柄情報 + primary_score 等。
-        history は二次で取り直すため、ここでは付けずに返す。
-    """
+def screen_primary(stock_histories, min_avg_volume=PRIMARY_MIN_AVG_VOLUME, top_n=50):
+    """一次スクリーニングを全銘柄に適用し、通過銘柄を primary_score 降順で返す。"""
     passed = []
     for item in stock_histories:
         result = primary_screen(item["history"], min_avg_volume=min_avg_volume)
@@ -137,8 +110,8 @@ def screen_primary(stock_histories, min_avg_volume=PRIMARY_MIN_AVG_VOLUME,
     return passed[:top_n]
 
 
+# ====== 補助 ======
 def _sma(series, window):
-    """単純移動平均（最新値）を返す。計算できなければ None。"""
     s = series.dropna()
     if len(s) < window:
         return None
@@ -146,7 +119,6 @@ def _sma(series, window):
 
 
 def _pct_change(series, days):
-    """days 日前から最新までの騰落率(%)。計算できなければ None。"""
     s = series.dropna()
     if len(s) <= days:
         return None
@@ -158,7 +130,6 @@ def _pct_change(series, days):
 
 
 def _daily_volatility(series, days=20):
-    """直近 days 日の日次騰落率の標準偏差(%)。"""
     s = series.dropna()
     if len(s) <= days:
         return None
@@ -168,151 +139,178 @@ def _daily_volatility(series, days=20):
     return float(returns.std() * 100)
 
 
-def score_stock(history, benchmark_close=None):
+def _clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def _valuation_ratio(valuation):
+    """PER/PBR/配当利回りから 0〜1 の割安感スコアを作る。取得不可は中立(0.5)。"""
+    if not valuation:
+        return 0.5
+    parts = []
+    per = valuation.get("per")
+    pbr = valuation.get("pbr")
+    dy = valuation.get("div_yield")
+    if per and per > 0:
+        parts.append(1.0 if per <= 15 else 0.6 if per <= 25 else 0.3 if per <= 40 else 0.15)
+    if pbr and pbr > 0:
+        parts.append(1.0 if pbr <= 1 else 0.6 if pbr <= 2 else 0.3 if pbr <= 4 else 0.15)
+    if dy is not None and dy > 0:
+        parts.append(1.0 if dy >= 3.5 else 0.7 if dy >= 2 else 0.5)
+    return sum(parts) / len(parts) if parts else 0.5
+
+
+def _size_from_mktcap(valuation):
+    """時価総額から規模区分を推定（取得不可は空）。"""
+    mc = (valuation or {}).get("market_cap")
+    if not mc:
+        return ""
+    if mc >= 1e12:
+        return "大型"
+    if mc >= 3e11:
+        return "中型"
+    return "小型"
+
+
+# ====== 二次スクリーニング（評価点 0〜10） ======
+def score_stock(history, benchmark_close=None, theme_tags=None,
+                valuation=None, continuity=None):
     """
-    1銘柄をスコアリングする。
+    1銘柄を 7つの評価軸でスコアリングする。
 
     引数:
         history: yfinance の OHLCV DataFrame
         benchmark_close: 市場平均(TOPIX連動ETF)の Close Series
-                         （相対強さ計算用、無ければ None）
+        theme_tags: 業種テーマ性評価に使うテーマタグのリスト
+        valuation: {"per","pbr","div_yield","market_cap"}（取得不可なら None で中立）
+        continuity: {"in_previous": bool}（前回上位かどうか。None で中立）
 
-    戻り値:
-        {
-            "score": 0.0〜10.0,
-            "price": 現在株価,
-            "reasons": [トレンド等の評価コメント, ...],
-            "risks": [リスクメモの文字列, ...],
-            "details": {観点ごとの素点},
-            "metrics": {テクニカル指標の生値},
-        }
-        計算できない場合は None。
-
-    注意: これは「売買推奨」ではなく、機械的なスクリーニングの評価です。
+    戻り値: dict（score/price/reasons/risks/details/metrics 等）。計算不可なら None。
+    注意: これは売買推奨ではなく、機械的なスクリーニング評価です。
     """
     close = history["Close"].dropna()
     volume = history["Volume"].dropna() if "Volume" in history else pd.Series(dtype=float)
-
     if len(close) < 75:
         return None
 
     price = float(close.iloc[-1])
-
-    sma5 = _sma(close, 5)
-    sma25 = _sma(close, 25)
-    sma75 = _sma(close, 75)
+    sma5, sma25, sma75 = _sma(close, 5), _sma(close, 25), _sma(close, 75)
     if sma5 is None or sma25 is None or sma75 is None:
         return None
 
-    reasons = []
-    risks = []
-    details = {}
+    theme_tags = theme_tags or []
+    reasons, risks, details = [], [], {}
 
-    # --- 1. 短期トレンド: 5日 > 25日 で上向き ---
-    if sma25:
-        gap_5_25 = (sma5 - sma25) / sma25 * 100
+    # 1. トレンド評価
+    checks = [price > sma25, price > sma5, sma5 > sma25, sma25 > sma75, price > sma75]
+    trend_ratio = sum(1 for c in checks if c) / len(checks)
+    details["トレンド"] = trend_ratio * WEIGHTS["トレンド"]
+    gap_5_25 = (sma5 - sma25) / sma25 * 100 if sma25 else 0.0
+    gap_25_75 = (sma25 - sma75) / sma75 * 100 if sma75 else 0.0
+    if sma5 > sma25 > sma75 and price > sma5:
+        reasons.append("5日線>25日線>75日線で移動平均が上向きに揃っている")
+    elif trend_ratio >= 0.6:
+        reasons.append("移動平均は概ね上向き")
     else:
-        gap_5_25 = 0.0
-    # -2%〜+5% を 0〜1 にマッピング
-    s1 = _clamp((gap_5_25 + 2) / 7) * WEIGHTS["短期トレンド"]
-    details["短期トレンド"] = s1
-    if gap_5_25 > 0:
-        reasons.append(f"5日線が25日線を{gap_5_25:.1f}%上回り短期上昇基調")
-    else:
-        risks.append(f"5日線が25日線を{abs(gap_5_25):.1f}%下回り短期は弱含み")
+        risks.append("移動平均の並びが整っておらずトレンドは不明瞭")
 
-    # --- 2. 中期トレンド: 25日 > 75日 で上向き ---
-    if sma75:
-        gap_25_75 = (sma25 - sma75) / sma75 * 100
-    else:
-        gap_25_75 = 0.0
-    s2 = _clamp((gap_25_75 + 3) / 10) * WEIGHTS["中期トレンド"]
-    details["中期トレンド"] = s2
-    if gap_25_75 > 0:
-        reasons.append(f"25日線が75日線を{gap_25_75:.1f}%上回り中期トレンドは上向き")
-    else:
-        risks.append(f"25日線が75日線を下回り中期トレンドは弱い")
-
-    # --- 3. 出来高: 直近5日平均 vs 25日平均 ---
-    vol_ratio = None
+    # 2. 出来高・流動性評価
+    vol_ratio = avg_vol = turnover = None
     if len(volume) >= 25:
         vol5 = float(volume.rolling(5).mean().iloc[-1])
         vol25 = float(volume.rolling(25).mean().iloc[-1])
         if vol25 > 0:
             vol_ratio = vol5 / vol25
-    if vol_ratio is not None:
-        # 0.7倍〜1.5倍 を 0〜1 にマッピング
-        s3 = _clamp((vol_ratio - 0.7) / 0.8) * WEIGHTS["出来高"]
-        if vol_ratio > 1.1:
-            reasons.append(f"直近出来高が平均比{vol_ratio:.2f}倍に増加し関心が高い")
-        elif vol_ratio < 0.8:
-            risks.append(f"直近出来高が平均比{vol_ratio:.2f}倍と低調")
-    else:
-        s3 = WEIGHTS["出来高"] * 0.5  # 不明なら中立
-    details["出来高"] = s3
+    if len(volume) >= 20:
+        avg_vol = float(volume.rolling(20).mean().iloc[-1])
+        turnover = avg_vol * price
+    base_vol = _clamp((vol_ratio - 0.7) / 0.8) if vol_ratio is not None else 0.5
+    liq = 1.0
+    if turnover is not None:
+        if turnover < 1e8:
+            liq = 0.5
+        elif turnover < 5e8:
+            liq = 0.8
+    details["出来高"] = base_vol * liq * WEIGHTS["出来高"]
+    if vol_ratio is not None and vol_ratio > 1.2:
+        reasons.append(f"直近出来高が20日平均比{vol_ratio:.2f}倍に増加")
+    if turnover is not None and turnover < 1e8:
+        risks.append("売買代金が小さく流動性が低い")
+    if vol_ratio is not None and vol_ratio >= 2.5:
+        risks.append("出来高急増が一過性の可能性に注意")
 
-    # --- 4. 相対強さ: 直近20日の対 市場平均(TOPIX連動ETF) ---
+    # 3. 相対強度評価
     stock_20 = _pct_change(close, 20)
     rel = None
     if stock_20 is not None and benchmark_close is not None and len(benchmark_close.dropna()) > 20:
-        bench_20 = _pct_change(benchmark_close, 20)
-        if bench_20 is not None:
-            rel = stock_20 - bench_20
+        b20 = _pct_change(benchmark_close, 20)
+        if b20 is not None:
+            rel = stock_20 - b20
     if rel is not None:
-        # -5%〜+5% を 0〜1 にマッピング
-        s4 = _clamp((rel + 5) / 10) * WEIGHTS["相対強さ"]
+        details["相対強度"] = _clamp((rel + 5) / 10) * WEIGHTS["相対強度"]
         if rel > 0:
-            reasons.append(f"過去20日で市場平均(TOPIX)を{rel:.1f}ポイント上回る相対的な強さ")
+            reasons.append(f"市場平均(TOPIX)を20日で{rel:.1f}pt上回る相対的な強さ")
         else:
-            risks.append(f"過去20日で市場平均(TOPIX)を{abs(rel):.1f}ポイント下回る")
+            risks.append(f"市場平均(TOPIX)を20日で{abs(rel):.1f}pt下回る")
     else:
-        s4 = WEIGHTS["相対強さ"] * 0.5
-    details["相対強さ"] = s4
+        details["相対強度"] = 0.5 * WEIGHTS["相対強度"]
 
-    # --- 5. 過熱回避: 直近5日の急騰をペナルティ ---
+    # 4. 業種テーマ性評価
+    n = len(theme_tags)
+    base_theme = 0.3 + 0.25 * n
+    if any(t in HIGH_ATTENTION_THEMES for t in theme_tags):
+        base_theme += 0.15
+    details["テーマ性"] = _clamp(base_theme) * WEIGHTS["テーマ性"]
+    if theme_tags:
+        reasons.append("テーマ性: " + "・".join(theme_tags[:3]))
+
+    # 5. バリュエーション評価（取得不可は中立）
+    details["割安感"] = _valuation_ratio(valuation) * WEIGHTS["割安感"]
+
+    # 6. 安定性・過熱回避
     surge_5 = _pct_change(close, 5)
-    if surge_5 is not None:
-        # +15%以上で過熱とみなし減点。0%〜15%上昇を満点〜0点へ
-        if surge_5 <= 0:
-            s5 = WEIGHTS["過熱回避"]  # 上げていなければ過熱なし＝満点
-        else:
-            s5 = _clamp(1 - surge_5 / 15) * WEIGHTS["過熱回避"]
-        if surge_5 >= 12:
-            risks.append(f"直近5日で{surge_5:.1f}%上昇しており短期的な過熱感に注意")
-    else:
-        s5 = WEIGHTS["過熱回避"] * 0.5
-    details["過熱回避"] = s5
-
-    # --- 6. 安定性: ボラティリティが高すぎないか ---
     vol_pct = _daily_volatility(close, 20)
-    if vol_pct is not None:
-        # 日次ボラ 1%以下=満点, 4%以上=0点
-        s6 = _clamp((4 - vol_pct) / 3) * WEIGHTS["安定性"]
-        if vol_pct >= 3.5:
-            risks.append(f"日次ボラティリティ{vol_pct:.1f}%と高く値動きが荒い")
+    oh = 0.5 if surge_5 is None else (1.0 if surge_5 <= 0 else _clamp(1 - surge_5 / 15))
+    stab = 0.5 if vol_pct is None else _clamp((4 - vol_pct) / 3)
+    details["安定性"] = (oh + stab) / 2 * WEIGHTS["安定性"]
+    if surge_5 is not None and surge_5 >= 12:
+        risks.append(f"直近5日で{surge_5:.1f}%上昇しており短期的な過熱感に注意")
+    if vol_pct is not None and vol_pct >= 3.5:
+        risks.append(f"日次ボラティリティ{vol_pct:.1f}%と高め")
+
+    # 規模に応じたリスクメモ
+    size = _size_from_mktcap(valuation)
+    if size == "小型":
+        risks.append("小型株のため値動きが大きくなりやすい")
+
+    # 7. 前回検証・継続性補正
+    if continuity is None or not continuity.get("in_previous"):
+        details["継続性"] = 0.5 * WEIGHTS["継続性"]
     else:
-        s6 = WEIGHTS["安定性"] * 0.5
-    details["安定性"] = s6
+        cont_ratio = 0.4 if (surge_5 is not None and surge_5 >= 12) else 0.85
+        details["継続性"] = cont_ratio * WEIGHTS["継続性"]
+        reasons.append("前回も上位で条件の継続性あり")
 
-    # --- 合計と正規化（0〜10）---
-    raw = s1 + s2 + s3 + s4 + s5 + s6
-    score = raw / MAX_RAW * 10.0
-    score = max(0.0, min(10.0, score))
+    raw = sum(details.values())
+    score = max(0.0, min(10.0, raw))
 
-    # 理由・リスクが空の場合の補完
     if not reasons:
-        reasons.append("際立った強さは見られないが大きな崩れもない中立的な状態")
+        reasons.append("際立った強さは限定的だが大きな崩れはない中立的な状態")
     if not risks:
-        risks.append("現時点で目立ったリスクシグナルは検出されず")
+        risks.append("目立ったリスクシグナルは検出されず")
 
-    # レポート/Flexで詳しく解説するためのテクニカル指標の生値
     metrics = {
-        "gap_5_25": gap_5_25,       # 5日線が25日線を上回る割合(%)
-        "gap_25_75": gap_25_75,     # 25日線が75日線を上回る割合(%)
-        "vol_ratio": vol_ratio,     # 直近5日平均出来高 / 25日平均（None有）
-        "rel_strength": rel,        # 対 市場平均(TOPIX) 20日相対騰落(pt)（None有）
-        "surge_5": surge_5,         # 直近5日騰落率(%)（None有）
-        "volatility": vol_pct,      # 日次ボラティリティ(%)（None有）
+        "gap_5_25": gap_5_25,
+        "gap_25_75": gap_25_75,
+        "vol_ratio": vol_ratio,
+        "turnover": turnover,
+        "rel_strength": rel,
+        "surge_5": surge_5,
+        "volatility": vol_pct,
+        "per": (valuation or {}).get("per"),
+        "pbr": (valuation or {}).get("pbr"),
+        "div_yield": (valuation or {}).get("div_yield"),
+        "market_cap": (valuation or {}).get("market_cap"),
         "sma5": sma5, "sma25": sma25, "sma75": sma75,
     }
 
@@ -323,42 +321,52 @@ def score_stock(history, benchmark_close=None):
         "risks": risks,
         "details": details,
         "metrics": metrics,
+        "theme_tags": theme_tags,
+        "size_category": size,
     }
 
 
-def _clamp(x, lo=0.0, hi=1.0):
-    """x を [lo, hi] に収める。"""
-    return max(lo, min(hi, x))
-
-
-def score_all(stock_histories, benchmark_df=None, top_n=10):
+def score_all(stock_histories, benchmark_df=None, top_n=5,
+              profiles=None, valuations=None, previous_codes=None):
     """
-    全候補銘柄をスコアリングし、上位 top_n 件を返す。
+    全候補銘柄をスコアリングし、評価点 MIN_FINAL_SCORE 以上の上位 top_n 件を返す。
 
     引数:
-        stock_histories: fetch_histories の戻り値
-        benchmark_df: 市場平均(TOPIX連動ETF)の履歴 DataFrame（相対強さの基準）
-    戻り値:
-        スコア降順の銘柄リスト（各要素に code/name/sector/score/metrics 等を含む）
+        profiles: {code: profile}（profile_loader 由来。theme_tags/business_summary を含む）
+        valuations: {code: valuation}（data_fetcher.get_valuation の結果）
+        previous_codes: 前回上位の証券コード集合（継続性補正に使用）
     """
     benchmark_close = None
     if benchmark_df is not None and "Close" in benchmark_df:
         benchmark_close = benchmark_df["Close"]
+    profiles = profiles or {}
+    valuations = valuations or {}
+    previous_codes = previous_codes or set()
 
     scored = []
     for item in stock_histories:
-        result = score_stock(item["history"], benchmark_close=benchmark_close)
+        code = item["code"]
+        prof = profiles.get(code) or {}
+        result = score_stock(
+            item["history"],
+            benchmark_close=benchmark_close,
+            theme_tags=prof.get("theme_tags") or [],
+            valuation=valuations.get(code),
+            continuity={"in_previous": code in previous_codes},
+        )
         if result is None:
-            print(f"[警告] スコア計算をスキップ: {item['name']} ({item['code']})")
+            print(f"[警告] スコア計算をスキップ: {item['name']} ({code})")
             continue
         scored.append({
-            "code": item["code"],
+            "code": code,
             "name": item["name"],
             "sector": item.get("sector", ""),
-            **result,
+            "business_summary": prof.get("business_summary", ""),
+            "profile_source": prof.get("source", ""),
+            "size_category": result.get("size_category") or prof.get("size_category", ""),
+            **{k: v for k, v in result.items() if k != "size_category"},
         })
 
-    # 評価点 MIN_FINAL_SCORE 未満は「今回は除外」（売買推奨ではなく抽出条件）
     scored = [s for s in scored if s["score"] >= MIN_FINAL_SCORE]
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:top_n]
