@@ -1,11 +1,13 @@
 name: Daily Stock Report
 
-# 毎朝7:00（日本時間 JST）に自動実行する。
-# GitHub Actions の cron は UTC で指定するため、JST 07:00 = UTC 22:00（前日）。
+# 毎朝7:00（日本時間 JST）ごろに自動実行する。
+# GitHub Actions の cron は UTC で指定するため、JST 07:00 ≒ UTC 22:00（前日）。
+# 毎時00分は GitHub Actions が最も混雑し遅延・欠落しやすいため、
+# あえて 03 分にずらして取りこぼしを減らす（GitHub のスケジューラはベストエフォート）。
 # 手動実行(workflow_dispatch)も可能。
 on:
   schedule:
-    - cron: "0 22 * * *"   # 22:00 UTC = 翌日 07:00 JST
+    - cron: "3 22 * * *"   # 22:03 UTC = 翌日 07:03 JST（混雑する毎時00分を回避）
   workflow_dispatch:
 
 jobs:
