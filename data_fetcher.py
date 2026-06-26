@@ -27,7 +27,7 @@ except ImportError as e:  # pragma: no cover
 #     TOPIX連動ETF(1306.T)を代理指標として使用している。
 MARKET_TICKERS = {
     "日経平均": "^N225",
-    "TOPIX(連動ETF)": "1306.T",
+    "TOPIX": "1306.T",
     "ドル円": "JPY=X",
     "S&P500": "^GSPC",
     "NASDAQ": "^IXIC",

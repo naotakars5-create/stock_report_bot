@@ -22,16 +22,19 @@ WEIGHTS = {
     "短期トレンド": 2.0,    # 5日 vs 25日
     "中期トレンド": 2.0,    # 25日 vs 75日
     "出来高": 1.5,          # 出来高増加
-    "相対強さ": 2.0,        # 対日経平均
-    "過熱回避": 1.5,        # 急騰しすぎていないか
+    "相対強さ": 2.0,        # 対 市場平均(TOPIX連動ETF)
+    "過熱回避": 1.5,        # 短期の過熱感
     "安定性": 1.0,          # ボラティリティ
 }
 MAX_RAW = sum(WEIGHTS.values())  # 10.0
 
+# 最終抽出の評価点の下限（これ未満は「今回は除外」）
+MIN_FINAL_SCORE = 6.0
+
 
 # 一次スクリーニングの既定パラメータ
 PRIMARY_MIN_AVG_VOLUME = 50000   # 直近20日平均出来高の下限（流動性フィルタ）
-PRIMARY_MAX_SURGE_5D = 20.0      # 直近5日の上昇率がこれを超えたら「急騰しすぎ」
+PRIMARY_MAX_SURGE_5D = 20.0      # 直近5日の上昇率がこれを超えたら過熱とみなす
 
 
 def primary_screen(history, min_avg_volume=PRIMARY_MIN_AVG_VOLUME):
@@ -178,13 +181,14 @@ def score_stock(history, benchmark_close=None):
         {
             "score": 0.0〜10.0,
             "price": 現在株価,
-            "expected_up_pct": 想定上昇率(%),
-            "reasons": [注目理由の文字列, ...],
-            "risks": [リスクの文字列, ...],
+            "reasons": [トレンド等の評価コメント, ...],
+            "risks": [リスクメモの文字列, ...],
             "details": {観点ごとの素点},
             "metrics": {テクニカル指標の生値},
         }
         計算できない場合は None。
+
+    注意: これは「売買推奨」ではなく、機械的なスクリーニングの評価です。
     """
     close = history["Close"].dropna()
     volume = history["Volume"].dropna() if "Volume" in history else pd.Series(dtype=float)
@@ -274,7 +278,7 @@ def score_stock(history, benchmark_close=None):
         else:
             s5 = _clamp(1 - surge_5 / 15) * WEIGHTS["過熱回避"]
         if surge_5 >= 12:
-            risks.append(f"直近5日で{surge_5:.1f}%急騰しており短期過熱に注意")
+            risks.append(f"直近5日で{surge_5:.1f}%上昇しており短期的な過熱感に注意")
     else:
         s5 = WEIGHTS["過熱回避"] * 0.5
     details["過熱回避"] = s5
@@ -294,9 +298,6 @@ def score_stock(history, benchmark_close=None):
     raw = s1 + s2 + s3 + s4 + s5 + s6
     score = raw / MAX_RAW * 10.0
     score = max(0.0, min(10.0, score))
-
-    # 想定上昇率: スコアと中期トレンドから簡易推定（あくまで目安）
-    expected_up = _estimate_upside(score, gap_25_75)
 
     # 理由・リスクが空の場合の補完
     if not reasons:
@@ -318,23 +319,11 @@ def score_stock(history, benchmark_close=None):
     return {
         "score": round(score, 1),
         "price": price,
-        "expected_up_pct": expected_up,
         "reasons": reasons,
         "risks": risks,
         "details": details,
         "metrics": metrics,
     }
-
-
-def _estimate_upside(score, mid_trend_gap):
-    """
-    想定上昇率(%)の簡易推定。スコアが高く中期トレンドが上向きなほど大きく。
-    あくまで機械的な目安であり、予測を保証するものではない。
-    """
-    base = (score - 5.0) * 1.2          # スコア5を基準に±
-    trend = max(-3.0, min(3.0, mid_trend_gap * 0.3))
-    upside = base + trend
-    return round(max(-5.0, min(15.0, upside)), 1)
 
 
 def _clamp(x, lo=0.0, hi=1.0):
@@ -369,5 +358,7 @@ def score_all(stock_histories, benchmark_df=None, top_n=10):
             **result,
         })
 
+    # 評価点 MIN_FINAL_SCORE 未満は「今回は除外」（売買推奨ではなく抽出条件）
+    scored = [s for s in scored if s["score"] >= MIN_FINAL_SCORE]
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:top_n]

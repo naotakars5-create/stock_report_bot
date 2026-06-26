@@ -13,6 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     # 全銘柄版は一次スクリーニングのデータ取得に時間がかかるため余裕を持たせる
     timeout-minutes: 60
+    # 前回検証用に data/report_history.csv をリポジトリへコミットして永続化するため
+    permissions:
+      contents: write
 
     steps:
       - name: リポジトリをチェックアウト
@@ -34,3 +37,21 @@ jobs:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
         run: python main.py
+
+      - name: 前回検証用の履歴を保存（コミット）
+        # スクリーニング結果の履歴(data/report_history.csv)をリポジトリへ
+        # 反映し、次回実行時の「前回レポートの検証」に使えるようにする。
+        run: |
+          if [ ! -f data/report_history.csv ]; then
+            echo "履歴ファイルが無いためスキップします。"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/report_history.csv
+          if git diff --staged --quiet; then
+            echo "履歴に変更はありません。"
+          else
+            git commit -m "Update report history [skip ci]"
+            git push
+          fi
