@@ -14,8 +14,9 @@ on:
 jobs:
   report:
     runs-on: ubuntu-latest
-    # 全銘柄版は一次スクリーニングのデータ取得に時間がかかるため余裕を持たせる
-    timeout-minutes: 60
+    # 全銘柄（約3,700）を対象にすると一次スクリーニングのデータ取得に
+    # 時間がかかるため、タイムアウトに余裕を持たせる。
+    timeout-minutes: 90
     # 前回検証用に data/report_history.csv をリポジトリへコミットして永続化するため
     permissions:
       contents: write

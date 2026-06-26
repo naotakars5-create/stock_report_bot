@@ -378,7 +378,24 @@ def build_flex_message(market, scored_stocks, stats=None, validation=None, now_s
         ],
     }
 
-    body = [_flex_text("市場概況", size="xs", color="#888888")]
+    body = []
+
+    # スクリーニング集計（分析対象／取得成功／一次通過／最終抽出）
+    body.append(_flex_text("スクリーニング", size="xs", color="#888888"))
+    for label, key in [("分析対象", "universe"), ("取得成功", "primary_fetched"),
+                       ("一次通過", "primary_passed"), ("最終抽出", "final")]:
+        body.append({
+            "type": "box", "layout": "horizontal", "contents": [
+                _flex_text(label, size="sm", color="#666666", flex=4),
+                _flex_text(f"{(stats or {}).get(key, 0):,}銘柄", size="sm",
+                           align="end", color="#333333", flex=6),
+            ],
+        })
+
+    body.append({"type": "separator", "margin": "md"})
+
+    # 市場概況
+    body.append(_flex_text("市場概況", size="xs", color="#888888", margin="md"))
     for nm in _MARKET_ORDER:
         if nm in market:
             body.append(_flex_market_row(nm, market[nm]))
@@ -386,20 +403,22 @@ def build_flex_message(market, scored_stocks, stats=None, validation=None, now_s
                            wrap=True, margin="sm"))
 
     body.append({"type": "separator", "margin": "md"})
+
+    # スクリーニング上位（簡易ランキング。各銘柄の詳細は後続の横スライドカード）
     body.append(_flex_text(f"スクリーニング上位{len(scored_stocks)}銘柄",
                            size="xs", color="#888888", margin="md"))
     if scored_stocks:
         for i, s in enumerate(scored_stocks, start=1):
             body.append({
-                "type": "box", "layout": "horizontal", "margin": "md", "contents": [
+                "type": "box", "layout": "horizontal", "margin": "sm", "contents": [
                     _flex_text(f"{i}. {s['name']}（{s['code']}）", size="sm",
                                color="#111111", flex=7, wrap=False),
                     _flex_text(f"{s['score']:.1f}", size="sm", weight="bold",
                                align="end", color="#0B3D91", flex=2),
                 ],
             })
-            body.append(_flex_text(_short_business(s), size="xxs", color="#666666"))
-            body.append(_flex_text(_card_tags(s), size="xxs", color="#888888"))
+        body.append(_flex_text("↓ 各銘柄の詳細は次のカードを横スライドでご覧いただけます",
+                               size="xxs", color="#999999", wrap=True, margin="sm"))
     else:
         body.append(_flex_text("条件を満たす銘柄は今回ありませんでした。",
                                size="sm", color="#555555", wrap=True))
@@ -422,3 +441,133 @@ def build_flex_message(market, scored_stocks, stats=None, validation=None, now_s
                        "spacing": "sm", "contents": body},
               "footer": footer}
     return f"{TITLE} {now_str}", bubble
+
+
+# ====== 銘柄カード（LINE Flex・横スライドカルーセル） ======
+# 評価点に応じた落ち着いた配色（青系＝強い／緑系＝標準／グレー系＝注意）
+def _card_palette(score):
+    if score >= 8.5:
+        return {"bg": "#1F3A5F", "accent": "#3B6FA0", "sub": "#AEC4E0"}  # 青系
+    if score >= 7.5:
+        return {"bg": "#27613E", "accent": "#3E8B5E", "sub": "#B6D9C2"}  # 緑系
+    return {"bg": "#4A4F57", "accent": "#7A828C", "sub": "#C9CDD3"}      # グレー系
+
+
+def _score_bar10(score):
+    """総合評価(0〜10)を 10ブロックのバーにする。例: 8.6 → █████████░。"""
+    blocks = max(0, min(10, int(round(score))))
+    return "█" * blocks + "░" * (10 - blocks)
+
+
+def _card_business(s, limit=46):
+    """カード用の事業内容（短縮）。業種から自動生成した場合は簡易分類と明示する。"""
+    b = (s.get("business_summary") or "").strip()
+    if s.get("profile_source") == "auto" or not b:
+        sector = s.get("sector") or "業種不明"
+        return f"{sector}・業種情報をもとにした簡易分類"
+    return b if len(b) <= limit else b[:limit] + "…"
+
+
+def _card_risk(s, limit=44):
+    """カード用のリスクメモ（最大2件・短縮）。"""
+    risks = s.get("risks") or []
+    if not risks:
+        return "目立ったリスクシグナルは検出されず"
+    txt = "／".join(risks[:2])
+    return txt if len(txt) <= limit else txt[:limit] + "…"
+
+
+def _flex_balance_rows(s, accent):
+    """評価バランス図（6軸）を Flex の行（ラベル＋■□バー＋n/5）リストで返す。"""
+    details = s.get("details", {})
+    rows = []
+    for k in _BALANCE_ORDER:
+        ratio = (details.get(k, 0) / WEIGHTS[k]) if WEIGHTS.get(k) else 0
+        blocks = max(0, min(5, int(ratio * 5 + 0.5)))
+        bar = "■" * blocks + "□" * (5 - blocks)
+        rows.append({
+            "type": "box", "layout": "horizontal", "contents": [
+                _flex_text(k, size="xs", color="#777777", flex=4),
+                _flex_text(bar, size="xs", color=accent, flex=5),
+                _flex_text(f"{blocks}/5", size="xs", color="#999999",
+                           align="end", flex=2),
+            ],
+        })
+    return rows
+
+
+def _stock_bubble(rank, s):
+    """1銘柄を1枚の Flex バブル（カード）にする。評価バランス図をカード内に必ず掲載。"""
+    pal = _card_palette(s["score"])
+
+    header = {
+        "type": "box", "layout": "vertical", "backgroundColor": pal["bg"],
+        "paddingAll": "14px", "spacing": "xs", "contents": [
+            _flex_text(f"{rank}位", color=pal["sub"], size="xs", weight="bold"),
+            _flex_text(f"{s['name']}（{s['code']}）", color="#FFFFFF",
+                       size="lg", weight="bold", wrap=True),
+            _flex_text(f"総合評価 {s['score']:.1f} / 10", color="#FFFFFF",
+                       size="md", weight="bold", margin="sm"),
+            _flex_text(_score_bar10(s["score"]), color="#FFFFFF", size="sm"),
+            _flex_text(_score_meaning(s["score"]), color=pal["sub"],
+                       size="xs", wrap=True),
+        ],
+    }
+
+    body_contents = [
+        {
+            "type": "box", "layout": "horizontal", "contents": [
+                _flex_text("業種", size="xs", color="#999999", flex=3),
+                _flex_text(s.get("sector") or "—", size="xs", color="#333333",
+                           flex=7, wrap=True),
+            ],
+        },
+        _flex_text(_card_business(s), size="sm", color="#333333",
+                   wrap=True, margin="sm"),
+        {"type": "separator", "margin": "md"},
+        _flex_text("評価バランス", size="xs", color="#888888", margin="md"),
+    ]
+    body_contents.extend(_flex_balance_rows(s, pal["accent"]))
+    body_contents.append({"type": "separator", "margin": "md"})
+    body_contents.append({
+        "type": "box", "layout": "horizontal", "margin": "md", "contents": [
+            _flex_text("タグ", size="xs", color="#999999", flex=3),
+            _flex_text(_theme_line(s), size="xs", color="#555555", flex=7, wrap=True),
+        ],
+    })
+    body_contents.append({
+        "type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+            _flex_text("リスク", size="xs", color="#999999", flex=3),
+            _flex_text(_card_risk(s), size="xs", color="#B5651D", flex=7, wrap=True),
+        ],
+    })
+
+    body = {"type": "box", "layout": "vertical", "paddingAll": "14px",
+            "spacing": "sm", "contents": body_contents}
+    footer = {
+        "type": "box", "layout": "vertical", "paddingAll": "10px",
+        "spacing": "xs", "contents": [
+            _flex_text("※売買推奨ではありません", size="xxs", color="#AAAAAA", wrap=True),
+            _flex_text("詳細はテキストレポートをご確認ください",
+                       size="xxs", color="#BBBBBB", wrap=True),
+        ],
+    }
+    return {"type": "bubble", "size": "mega", "header": header,
+            "body": body, "footer": footer}
+
+
+def build_stock_cards(scored_stocks, now_str=None):
+    """
+    スクリーニング上位銘柄を横スライドできる Flex カルーセルにする。
+
+    1銘柄＝1カード（最大5枚）。各カードに 順位／銘柄名／コード／業種／事業内容／
+    総合評価／評価ランク／タグ／評価バランス図／リスクメモ／注意書きを掲載する。
+    戻り値: (alt_text, carousel_contents)。銘柄が無ければ None。
+    """
+    if not scored_stocks:
+        return None
+    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    bubbles = [_stock_bubble(i, s) for i, s in enumerate(scored_stocks, start=1)]
+    carousel = {"type": "carousel", "contents": bubbles}
+    alt = f"スクリーニング上位{len(bubbles)}銘柄カード（{now_str}）"
+    return alt, carousel

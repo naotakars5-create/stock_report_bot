@@ -59,9 +59,10 @@ PROFILES_CSV = "company_profiles.csv"
 AUTO_FETCH_JPX = True       # 起動時にJPX公式の上場銘柄一覧(data_j.xls)を自動取得する
 JPX_CSV_MAX_AGE_HOURS = 20  # 直近取得からこの時間内なら再ダウンロードを省略
 
-# 分析対象の最大銘柄数。環境変数 MAX_STOCKS で上書き可能（none/all で全銘柄）。
-# デフォルトは処理負荷を抑えた 500。全銘柄に広げる方法は README を参照。
-MAX_STOCKS = _int_env("MAX_STOCKS", 500)
+# 分析対象の最大銘柄数。原則として「全銘柄」が既定（None=制限なし）。
+# デバッグ用に環境変数 MAX_STOCKS を設定したときだけ、その件数に絞り込む
+# （none/all/0/未設定 → 全銘柄）。全銘柄版は取得に時間がかかる点は README を参照。
+MAX_STOCKS = _int_env("MAX_STOCKS", None)
 
 PRIMARY_TOP_N = 50          # 一次スクリーニングで残す銘柄数
 FINAL_TOP_N = 5             # 最終的に抽出する銘柄数（上位5銘柄）
@@ -195,11 +196,16 @@ def main():
         bench_pct = report_history.benchmark_return(benchmark_df, previous["run_date"])
         validation = report_history.build_validation(previous, price_map, bench_pct)
 
-    # 6. レポート出力（ターミナル＝詳細テキスト、LINE＝まとめカード＋詳細テキスト）
+    # 6. レポート出力
+    #    LINE送信順: (1)全体サマリーカード → (2)上位5銘柄の横スライドカード
+    #              → (3)詳細テキストレポート
     report = report_writer.build_report(market, scored_stocks, stats, validation=validation)
     flex_messages = [
         report_writer.build_flex_message(market, scored_stocks, stats, validation=validation)
     ]
+    cards = report_writer.build_stock_cards(scored_stocks)
+    if cards:
+        flex_messages.append(cards)
     print()
     print(report)
     _deliver(report, flex_messages)
