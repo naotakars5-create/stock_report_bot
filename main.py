@@ -146,8 +146,10 @@ def main():
         print(f"[警告] ニュース取得で予期せぬエラー（ニュース評価は中立）: {e}")
         headlines = []
     macro_context = macro_analyzer.analyze(headlines, market)
-    if macro_context.get("summary_themes"):
-        print(f"  主要テーマ: {' / '.join(macro_context['summary_themes'])}")
+    if macro_context.get("major_themes"):
+        print(f"  主要テーマ: {' / '.join(macro_context['major_themes'])}")
+    if macro_context.get("market_summary"):
+        print(f"  マクロ概況: {macro_context['market_summary']}")
     if not macro_context.get("available"):
         print("[情報] ニュース取得が一部制限されています（ニュース評価は中立扱い）。")
 

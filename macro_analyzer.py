@@ -5,14 +5,14 @@ macro_analyzer.py
 「世界情勢・ニュース環境」を機械的に評価するモジュール。
 
 責務:
-  - 見出しから市場テーマ（半導体・防衛・円安・金利 等）を抽出する
-  - 各テーマの強度を数値化する（0〜1）
-  - テーマを銘柄の theme_tags と照合し、銘柄ごとの「ニュース環境」シグナルを作る
-  - サマリー用の主要テーマ・マクロコメントを用意する
+  - 見出しから市場テーマ（半導体・防衛・円安・金利 等）を抽出して強度を数値化
+  - テーマを銘柄の theme_tags / sector / business_summary と照合し、
+    **銘柄ごと**のニュース関連スコア・関連理由・注意点・解説コメントを作る
+  - サマリー用の主要テーマ・各種マクロコメント（為替/米国市場/金利/商品/地政学）を用意
 
 重要な方針:
-  - これは投資助言ではありません。「買い」「上昇予想」等の表現は使いません。
-    「意識されやすい」「関連がある」「注意」といった機械的な関連性のみを示します。
+  - これは投資助言ではありません。「買い」「買われる」「上がる」「狙い目」「儲かる」等の
+    表現は使いません。「意識されやすい」「関連がある」「注意」といった機械的な関連性のみを示します。
   - 失敗してもプログラムを止めない（analyze は常に有効な context を返す）。
 """
 
@@ -31,6 +31,7 @@ NEWS_THEME_KEYWORDS = {
     "金利上昇": ["利上げ", "金利上昇", "長期金利", "利回り上昇", "金利高"],
     "金利低下": ["利下げ", "金利低下", "金利低"],
     "銀行": ["銀行", "メガバンク", "金融株", "日銀"],
+    "保険": ["保険", "生保", "損保"],
     "商社": ["商社"],
     "資源": ["資源", "鉱物", "レアアース", "非鉄"],
     "原油": ["原油", "WTI", "OPEC", "石油"],
@@ -43,11 +44,16 @@ NEWS_THEME_KEYWORDS = {
     "NASDAQ": ["ナスダック", "NASDAQ"],
     "SOX指数": ["SOX", "フィラデルフィア半導体"],
     "自動車": ["自動車", "EV", "トヨタ", "ホンダ"],
-    "物流": ["物流", "海運", "運賃", "コンテナ"],
+    "機械": ["工作機械", "機械受注", "産業機械", "設備投資"],
+    "重工": ["重工", "プラント"],
+    "造船": ["造船", "新造船"],
     "建設": ["建設", "ゼネコン"],
     "インフラ": ["インフラ"],
     "医療": ["医療", "製薬", "創薬"],
     "サイバーセキュリティ": ["サイバー", "セキュリティ", "ランサムウェア"],
+    "物流": ["物流", "海運", "運賃", "コンテナ"],
+    "小売": ["小売", "百貨店", "スーパー", "コンビニ", "個人消費"],
+    "不動産": ["不動産", "REIT", "マンション", "オフィス市況"],
 }
 
 # ニュース市場テーマ → 銘柄 theme_tags への影響（正＝関連プラス／負＝注意）
@@ -63,6 +69,7 @@ NEWS_THEME_TO_TAGS = {
     "金利上昇": {"金融": 1.0, "DX": -0.4, "内需ディフェンシブ": -0.2},
     "金利低下": {"金融": -0.4, "DX": 0.4, "内需ディフェンシブ": 0.3},
     "銀行": {"金融": 1.0},
+    "保険": {"金融": 1.0},
     "商社": {"商社": 1.0, "資源": 0.5},
     "資源": {"資源": 1.0, "商社": 0.5, "エネルギー": 0.5},
     "原油": {"資源": 0.8, "エネルギー": 0.8, "商社": 0.5, "物流": -0.4, "電力": -0.3},
@@ -75,46 +82,61 @@ NEWS_THEME_TO_TAGS = {
     "NASDAQ": {"半導体": 0.7, "AI": 0.5, "データセンター": 0.4, "DX": 0.4},
     "SOX指数": {"半導体": 1.0, "AI": 0.4, "データセンター": 0.4},
     "自動車": {"円安メリット": 0.5, "重工": 0.2},
-    "物流": {"物流": 1.0},
+    "機械": {"重工": 0.5, "円安メリット": 0.3},
+    "重工": {"重工": 1.0, "防衛": 0.4},
+    "造船": {"造船": 1.0, "物流": 0.3},
     "建設": {"建設": 1.0, "インフラ": 0.5},
     "インフラ": {"インフラ": 1.0, "建設": 0.4, "電力": 0.3},
     "医療": {"医療": 1.0},
     "サイバーセキュリティ": {"サイバーセキュリティ": 1.0, "DX": 0.4, "AI": 0.3},
+    "物流": {"物流": 1.0},
+    "小売": {"内需ディフェンシブ": 0.6, "インバウンド": 0.4},
+    "不動産": {"内需ディフェンシブ": 0.4},
 }
 
-# テーマ → 銘柄カード/詳細用の短い説明（プラス方向）。売買推奨表現は使わない。
-NEWS_THEME_PHRASE = {
-    "半導体": "半導体テーマに関心が向かいやすい地合い",
-    "AI": "AI関連テーマが市場で意識されやすい環境",
-    "データセンター": "データセンター関連が話題になりやすい環境",
-    "防衛": "防衛関連テーマが市場で意識されやすい環境",
-    "地政学リスク": "地政学リスクから防衛・資源関連が意識されやすい環境",
-    "円安": "円安環境では輸出関連として注目されやすい",
-    "金利上昇": "金利上昇局面で金融関連が意識されやすい環境",
-    "金利低下": "金利低下局面でグロース関連が意識されやすい環境",
-    "銀行": "金融関連テーマが市場で意識されやすい環境",
-    "商社": "商社・資源関連が話題になりやすい環境",
-    "資源": "資源・エネルギー関連が意識されやすい環境",
-    "原油": "原油高で資源・商社関連が意識されやすい環境",
-    "LNG": "エネルギー関連テーマが意識されやすい環境",
-    "電力": "電力・インフラ関連が話題になりやすい環境",
-    "原発": "原子力関連テーマが意識されやすい環境",
-    "インバウンド": "インバウンド関連として注目されやすい環境",
-    "米国株": "米国株堅調で関連テーマに関心が向かいやすい地合い",
-    "NASDAQ": "NASDAQ動向で半導体・グロースが意識されやすい環境",
-    "SOX指数": "半導体指数の動向が意識されやすい環境",
-    "自動車": "自動車・輸出関連が話題になりやすい環境",
-    "物流": "物流関連テーマが意識されやすい環境",
-    "建設": "建設・インフラ関連が話題になりやすい環境",
-    "インフラ": "インフラ関連テーマが意識されやすい環境",
-    "医療": "医療・製薬関連が話題になりやすい環境",
-    "サイバーセキュリティ": "サイバーセキュリティ関連が意識されやすい環境",
+# テーマ → 「〇〇な局面」という環境の説明（銘柄別コメントの前半に使う）
+NEWS_ENV = {
+    "半導体": "米NASDAQや半導体関連指数が堅調な局面",
+    "AI": "AI・データセンター投資のニュースが増える局面",
+    "データセンター": "データセンター投資の話題が増える局面",
+    "防衛": "防衛費や地政学リスク関連の報道が増える局面",
+    "地政学リスク": "地政学リスクが意識される局面",
+    "円安": "円安が進む局面",
+    "円高": "円高が進む局面",
+    "金利上昇": "長期金利の上昇が意識される局面",
+    "金利低下": "金利低下が意識される局面",
+    "銀行": "金利や金融政策が話題になる局面",
+    "保険": "金利動向が話題になる局面",
+    "商社": "資源・エネルギー価格が話題になる局面",
+    "資源": "資源価格が意識される局面",
+    "原油": "原油価格の上昇が意識される局面",
+    "LNG": "エネルギー価格が話題になる局面",
+    "電力": "電力・エネルギー政策が話題になる局面",
+    "原発": "原子力政策が話題になる局面",
+    "インバウンド": "訪日観光の回復が話題になる局面",
+    "中国景気": "中国経済の動向が意識される局面",
+    "米国株": "米国株が堅調な局面",
+    "NASDAQ": "米ハイテク株が堅調な局面",
+    "SOX指数": "半導体指数が意識される局面",
+    "自動車": "自動車・輸出関連が話題になる局面",
+    "機械": "設備投資・機械受注が話題になる局面",
+    "重工": "防衛・インフラ関連の報道が増える局面",
+    "造船": "海運・造船が話題になる局面",
+    "建設": "建設・インフラ投資が話題になる局面",
+    "インフラ": "インフラ投資が話題になる局面",
+    "医療": "医療・製薬が話題になる局面",
+    "サイバーセキュリティ": "サイバーセキュリティが話題になる局面",
+    "物流": "物流・海運が話題になる局面",
+    "小売": "個人消費・小売が話題になる局面",
+    "不動産": "金利と不動産市況が話題になる局面",
 }
 
-# 注意（マイナス方向）テーマの短い説明
-NEWS_THEME_CAUTION_PHRASE = {
-    "円高": "円高方向では輸出関連の値動きに注意",
-    "中国景気": "中国景気懸念で素材・機械関連は値動きに注意",
+# 注意（マイナス方向）テーマの解説
+_CAUTION_ENV = {
+    "円高": "一方で、円高が進む局面では輸出関連の採算に注意したい。",
+    "中国景気": "一方で、中国景気の減速懸念が強まると素材・機械関連は影響を受けやすい点に注意。",
+    "金利上昇": "一方で、金利上昇局面ではグロース・不動産関連の重しになりやすい点に注意。",
+    "原油": "一方で、原油高が進むと運輸・電力などコスト増業種には逆風になりやすい点に注意。",
 }
 
 
@@ -122,34 +144,35 @@ def _clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
 
 
-def analyze(headlines, market=None):
-    """
-    ニュース見出しと市場データから macro_context（ニュース環境の評価材料）を作る。
-
-    戻り値 dict:
-        available       : ニュースを取得できたか
-        headlines       : 主要見出し（表示用・先頭数件）
-        theme_hits      : {テーマ: 出現件数}
-        theme_intensity : {テーマ: 強度0〜1}
-        tag_signal      : {銘柄タグ: シグナル(+/-)}（ニュース環境評価に使用）
-        summary_themes  : 主要テーマ（表示用・強度順）
-        macro_comment   : マクロ環境の短いコメント
-        note            : 取得制限時の注意文（無ければ空）
-    どんな入力でも例外を投げずに有効な dict を返す。
-    """
-    try:
-        return _analyze(headlines, market)
-    except Exception as e:  # 何があってもニュートラルな context を返す
-        print(f"[マクロ分析] 分析中に例外（ニュース評価は中立扱い）: {e}")
-        return _neutral_context("ニュース分析に失敗したため中立扱いにしました。")
-
-
 def _neutral_context(note=""):
     return {
-        "available": False, "headlines": [], "theme_hits": {}, "theme_intensity": {},
-        "tag_signal": {}, "summary_themes": [], "macro_comment": "本日の主要テーマは限定的です。",
+        "available": False,
+        "raw_headlines": [],
+        "theme_hits": {},
+        "theme_intensity": {},
+        "tag_signal": {},
+        "major_themes": [],
+        "positive_theme_tags": [],
+        "caution_theme_tags": [],
+        "fx_comment": "",
+        "us_market_comment": "",
+        "rates_comment": "",
+        "commodity_comment": "",
+        "geopolitical_comment": "",
+        "market_summary": "本日の主要テーマは限定的です。",
+        "macro_comment": "本日の主要テーマは限定的です。",  # 後方互換
+        "summary_themes": [],                                  # 後方互換
         "note": note,
     }
+
+
+def analyze(headlines, market=None):
+    """ニュース見出しと市場データから macro_context を作る。失敗しても中立contextを返す。"""
+    try:
+        return _analyze(headlines, market)
+    except Exception as e:
+        print(f"[マクロ分析] 分析中に例外（ニュース評価は中立扱い）: {e}")
+        return _neutral_context("ニュース分析に失敗したため中立扱いにしました。")
 
 
 def _analyze(headlines, market):
@@ -157,161 +180,256 @@ def _analyze(headlines, market):
     market = market or {}
     available = bool(headlines)
 
-    # 1. 見出しからテーマ出現件数を数える
+    # 1. 見出しからテーマ出現件数 → 強度（0〜1。3件以上で最大）
     theme_hits = {}
     for theme, kws in NEWS_THEME_KEYWORDS.items():
         c = sum(1 for h in headlines if any(k in h for k in kws))
         if c:
             theme_hits[theme] = c
-
-    # 2. テーマ強度（0〜1）。3件以上で最大とみなす。
     theme_intensity = {t: _clamp(c / 3.0) for t, c in theme_hits.items()}
 
     tag_signal = defaultdict(float)
-    macro_bits = []
 
-    # 3. 市場データ由来の方向性（為替・米国株）
+    # 2. 市場データ由来の方向性（為替・米国株）
+    fx_comment = us_comment = ""
     fx = (market.get("ドル円") or {}).get("change_pct")
     if fx is not None:
         if fx >= 0.15:
             theme_intensity["円安"] = max(theme_intensity.get("円安", 0), _clamp(abs(fx)))
-            macro_bits.append("ドル円は円安方向")
+            fx_comment = "ドル円は円安方向。輸出・海外売上比率の高い業種が意識されやすい。"
         elif fx <= -0.15:
             theme_intensity["円高"] = max(theme_intensity.get("円高", 0), _clamp(abs(fx)))
-            macro_bits.append("ドル円は円高方向")
+            fx_comment = "ドル円は円高方向。輸出関連の採算には留意したい。"
+        else:
+            fx_comment = "ドル円はおおむね横ばい。"
 
-    us_changes = [
-        (market.get(k) or {}).get("change_pct")
-        for k in ("S&P500", "NASDAQ")
-    ]
+    us_changes = [(market.get(k) or {}).get("change_pct") for k in ("S&P500", "NASDAQ")]
     us_changes = [v for v in us_changes if v is not None]
     if us_changes:
         avg = sum(us_changes) / len(us_changes)
         if avg >= 0.2:
-            macro_bits.append("米国株は堅調")
+            us_comment = "米国株は堅調。半導体・グロース関連が連想されやすい。"
             theme_intensity["米国株"] = max(theme_intensity.get("米国株", 0), 0.6)
             for tag, w in {"半導体": 0.5, "AI": 0.4, "データセンター": 0.4, "DX": 0.3}.items():
                 tag_signal[tag] += w * 0.5
         elif avg <= -0.2:
-            macro_bits.append("米国株は軟調")
+            us_comment = "米国株は軟調。米ハイテク株の反落時は値動きが荒くなりやすい。"
             for tag, w in {"半導体": 0.5, "AI": 0.4, "データセンター": 0.4, "DX": 0.3}.items():
                 tag_signal[tag] -= w * 0.5
         else:
-            macro_bits.append("米国株は横ばい圏")
+            us_comment = "米国株は横ばい圏。"
 
-    # 4. テーマ強度 → 銘柄タグのシグナルへ反映
+    # 3. テーマ強度 → 銘柄タグのシグナルへ反映
     for theme, inten in theme_intensity.items():
         for tag, w in NEWS_THEME_TO_TAGS.get(theme, {}).items():
             tag_signal[tag] += w * inten * 0.5
 
-    # 5. 表示用の主要テーマ（強度順。強いものを優先）
+    # 4. 主要テーマ（強度順）と、プラス/注意のタグ集合
     ordered = sorted(theme_intensity.items(), key=lambda kv: kv[1], reverse=True)
-    summary_themes = [t for t, v in ordered if v >= 0.34][:5]
-    if not summary_themes:
-        summary_themes = [t for t, _ in ordered[:4]]
+    major_themes = [t for t, v in ordered if v >= 0.34][:6] or [t for t, _ in ordered[:4]]
 
-    macro_comment = _build_macro_comment(macro_bits, summary_themes, available)
+    pos_tags, cau_tags = [], []
+    for tag, sig in tag_signal.items():
+        if sig >= 0.12:
+            pos_tags.append((tag, sig))
+        elif sig <= -0.12:
+            cau_tags.append((tag, sig))
+    positive_theme_tags = [t for t, _ in sorted(pos_tags, key=lambda x: x[1], reverse=True)]
+    caution_theme_tags = [t for t, _ in sorted(cau_tags, key=lambda x: x[1])]
+
+    # 5. 各種マクロコメント
+    rates_comment = _theme_comment(
+        theme_intensity, {"金利上昇": "長期金利の上昇が意識される局面では銀行・保険が注目されやすい。",
+                          "金利低下": "金利低下局面ではグロース関連が意識されやすい。"})
+    commodity_comment = _theme_comment(
+        theme_intensity, {"原油": "原油価格の上昇で資源・商社が意識されやすい一方、運輸・電力はコスト増に注意。",
+                          "資源": "資源価格の動向が素材・商社関連に波及しやすい。",
+                          "LNG": "エネルギー価格の動向が電力・商社に関連しやすい。"})
+    geopolitical_comment = _theme_comment(
+        theme_intensity, {"地政学リスク": "地政学リスクが意識され、防衛・資源・エネルギー関連に関心が向きやすい。",
+                          "防衛": "防衛関連の報道が増え、防衛・重工テーマが意識されやすい。"})
+
+    market_summary = _build_market_summary(
+        major_themes, fx_comment, us_comment, geopolitical_comment, available)
+
     note = "" if available else "ニュース取得が一部制限されています（ニュース評価は中立扱い）。"
 
     return {
         "available": available,
-        "headlines": headlines[:8],
+        "raw_headlines": headlines[:12],
         "theme_hits": theme_hits,
         "theme_intensity": dict(theme_intensity),
         "tag_signal": dict(tag_signal),
-        "summary_themes": summary_themes,
-        "macro_comment": macro_comment,
+        "major_themes": major_themes,
+        "positive_theme_tags": positive_theme_tags,
+        "caution_theme_tags": caution_theme_tags,
+        "fx_comment": fx_comment,
+        "us_market_comment": us_comment,
+        "rates_comment": rates_comment,
+        "commodity_comment": commodity_comment,
+        "geopolitical_comment": geopolitical_comment,
+        "market_summary": market_summary,
+        "macro_comment": market_summary,        # 後方互換
+        "summary_themes": major_themes,          # 後方互換
         "note": note,
     }
 
 
-def _build_macro_comment(macro_bits, summary_themes, available):
-    parts = []
-    if macro_bits:
-        parts.append("、".join(macro_bits))
-    if summary_themes:
-        parts.append("・".join(summary_themes[:4]) + "が意識されやすい環境")
-    if not parts:
+def _theme_comment(theme_intensity, mapping):
+    """強度が立っているテーマがあれば、対応する1文を返す。"""
+    best, best_inten = None, 0.0
+    for theme, phrase in mapping.items():
+        inten = theme_intensity.get(theme, 0)
+        if inten > best_inten:
+            best, best_inten = phrase, inten
+    return best or ""
+
+
+def _build_market_summary(major_themes, fx_comment, us_comment, geo_comment, available):
+    if not available and not major_themes:
         return "本日の主要テーマは限定的です。"
-    return "。".join(parts) + "。"
+    bits = []
+    if us_comment:
+        bits.append(us_comment.rstrip("。"))
+    if major_themes:
+        bits.append("・".join(major_themes[:4]) + "が意識されやすい環境")
+    if geo_comment:
+        bits.append(geo_comment.rstrip("。"))
+    elif fx_comment:
+        bits.append(fx_comment.rstrip("。"))
+    if not bits:
+        return "本日の主要テーマは限定的です。"
+    return "。".join(bits) + "。"
 
 
-# ====== 銘柄ごとのニュース環境（スコア・表示） ======
-def stock_news_ratio(macro_context, theme_tags):
-    """
-    銘柄の theme_tags と macro の tag_signal を照合し、ニュース環境評価(0〜1)を返す。
-    関連シグナルが無ければ中立(0.5)。
-    """
-    if not macro_context:
-        return 0.5
-    sig = macro_context.get("tag_signal") or {}
-    tags = theme_tags or []
-    if not sig or not tags:
-        return 0.5
-    rel = [sig.get(t, 0.0) for t in tags]
-    rel = [v for v in rel if v != 0]
-    if not rel:
-        return 0.5
-    rel.sort(key=abs, reverse=True)
-    eff = sum(rel[:2]) / min(2, len(rel))   # 効いている上位2タグの平均
-    return _clamp(0.5 + eff)
-
-
-def _matched_themes(macro_context, theme_tags):
+# ====== 銘柄ごとのニュース関連（スコア・理由・解説コメント） ======
+def _stock_matched_themes(theme_tags, macro_context):
     """銘柄タグに関連する（プラス/マイナス）テーマを効き目順に返す。"""
-    if not macro_context:
-        return []
     tags = set(theme_tags or [])
-    intensity = macro_context.get("theme_intensity") or {}
-    scored = []
+    intensity = (macro_context or {}).get("theme_intensity") or {}
+    pos, cau = [], []
     for theme, inten in intensity.items():
         weights = NEWS_THEME_TO_TAGS.get(theme, {})
-        eff = sum(weights.get(t, 0.0) for t in tags) * inten
-        if abs(eff) >= 0.05:
-            scored.append((theme, eff))
-    scored.sort(key=lambda x: abs(x[1]), reverse=True)
-    return scored
+        eff_pos = sum(w for t, w in weights.items() if t in tags and w > 0) * inten
+        eff_neg = sum(w for t, w in weights.items() if t in tags and w < 0) * inten
+        if eff_pos > 0.05:
+            pos.append((theme, eff_pos))
+        if eff_neg < -0.05:
+            cau.append((theme, eff_neg))
+    pos.sort(key=lambda x: x[1], reverse=True)
+    cau.sort(key=lambda x: x[1])
+    return pos, cau
 
 
-def stock_news_line(macro_context, theme_tags):
-    """銘柄カード/詳細用の「ニュース環境」1〜2行を返す。"""
-    matched = _matched_themes(macro_context, theme_tags)
-    if not matched:
-        return "本日は明確なニューステーマは限定的"
-    parts = []
-    for theme, eff in matched[:2]:
-        if eff >= 0:
-            phrase = NEWS_THEME_PHRASE.get(theme)
-        else:
-            phrase = NEWS_THEME_CAUTION_PHRASE.get(theme) or f"{theme}の影響で値動きに注意"
-        if phrase and phrase not in parts:
-            parts.append(phrase)
-    if not parts:
-        return "本日は明確なニューステーマは限定的"
-    return "。".join(parts[:2])
+def _business_theme_hits(business_summary, macro_context):
+    """business_summary 内の語が、当日テーマのキーワードに一致するものを返す。"""
+    if not business_summary:
+        return []
+    intensity = (macro_context or {}).get("theme_intensity") or {}
+    hits = []
+    for theme in intensity:
+        if any(k in business_summary for k in NEWS_THEME_KEYWORDS.get(theme, [])):
+            hits.append(theme)
+    return hits
 
 
-def stock_news_reason(macro_context, theme_tags):
-    """評価理由の「ニュース環境との関連」1行を返す（無ければ None）。"""
-    matched = _matched_themes(macro_context, theme_tags)
-    if not matched:
-        return None
-    theme, eff = matched[0]
-    if eff >= 0:
-        return NEWS_THEME_PHRASE.get(theme) or f"{theme}テーマが足元のニュース環境と関連"
-    return NEWS_THEME_CAUTION_PHRASE.get(theme) or f"{theme}の影響で値動きに注意"
+def _related_tags_for_theme(theme_tags, theme):
+    """ある当日テーマに関連する、この銘柄のタグを返す。"""
+    weights = NEWS_THEME_TO_TAGS.get(theme, {})
+    return [t for t in (theme_tags or []) if weights.get(t, 0) > 0]
+
+
+def calculate_macro_relevance_score(theme_tags, sector, business_summary, macro_context):
+    """
+    銘柄とニュース環境の関連度をスコア化する。
+
+    戻り値: {macro_score(0〜1), macro_reason(str|None), macro_caution(str|None),
+             matched_positive(list), matched_caution(list)}
+    """
+    if not macro_context or not macro_context.get("available"):
+        return {"macro_score": 0.5, "macro_reason": None, "macro_caution": None,
+                "matched_positive": [], "matched_caution": []}
+
+    pos, cau = _stock_matched_themes(theme_tags, macro_context)
+    biz_hits = _business_theme_hits(business_summary, macro_context)
+
+    score = 0.5
+    for _, eff in pos[:3]:
+        score += min(0.18, 0.10 + eff * 0.08)
+    if biz_hits:
+        score += 0.08
+    for _, eff in cau[:2]:
+        score -= min(0.15, abs(eff) * 0.10 + 0.05)
+    score = _clamp(score, 0.25, 1.0)
+
+    macro_reason = None
+    if pos:
+        themes = "・".join(dict.fromkeys([t for t, _ in pos[:2]]))
+        related = []
+        for theme, _ in pos[:2]:
+            related += _related_tags_for_theme(theme_tags, theme)
+        tagstr = "・".join(dict.fromkeys(related))[:40] or "・".join((theme_tags or [])[:2])
+        macro_reason = f"{tagstr}タグが、{themes}関連のニュースと関連"
+    elif biz_hits:
+        macro_reason = f"事業内容が{'・'.join(biz_hits[:2])}関連の話題と接点"
+
+    macro_caution = None
+    if cau:
+        ct = "・".join([t for t, _ in cau[:2]])
+        macro_caution = f"{ct}関連の逆風には注意"
+    elif pos:
+        macro_caution = "テーマ先行で短期過熱になりやすい点には注意"
+
+    return {"macro_score": round(score, 3), "macro_reason": macro_reason,
+            "macro_caution": macro_caution,
+            "matched_positive": [t for t, _ in pos], "matched_caution": [t for t, _ in cau]}
+
+
+def build_stock_news_comment(theme_tags, sector, business_summary, macro_context, detailed=False):
+    """
+    銘柄ごとの「ニュース環境」解説（2〜3文）。theme_tags・sector・business_summary と
+    当日テーマを照合して固有のコメントを作る。detailed=True でやや詳しい版。
+    """
+    if not macro_context or not macro_context.get("available"):
+        return "明確な個別テーマは限定的。現時点では特定のニュースとの強い結びつきは確認しづらい。"
+
+    pos, cau = _stock_matched_themes(theme_tags, macro_context)
+    biz_hits = _business_theme_hits(business_summary, macro_context)
+    if not pos and not biz_hits:
+        return "明確な個別テーマは限定的。本日のニュースとの強い結びつきは確認しづらい。"
+
+    theme = pos[0][0] if pos else biz_hits[0]
+    env = NEWS_ENV.get(theme, f"{theme}関連の報道が増える局面")
+    related = _related_tags_for_theme(theme_tags, theme) or (theme_tags or [])[:2]
+    tagstr = "・".join(dict.fromkeys(related))[:40] or (sector or "同社の事業")
+
+    sentences = [f"{env}では、{tagstr}を持つ同社は市場の関心対象になりやすい。"]
+    if detailed and business_summary:
+        sentences.append(f"事業は「{business_summary}」で、{theme}関連の話題との接点がある。")
+    elif len(pos) > 1:
+        sentences.append(f"{pos[1][0]}の動向とも関連しやすい。")
+
+    if cau:
+        sentences.append(_CAUTION_ENV.get(
+            cau[0][0], f"一方で、{cau[0][0]}関連の逆風時には値動きが荒くなりやすい点に注意。"))
+    else:
+        sentences.append("一方で、テーマ先行で短期的に値動きが荒くなりやすく、過熱感には注意。")
+
+    return ("" if not detailed else " ").join(sentences)
 
 
 if __name__ == "__main__":
+    import json
     sample = [
-        "半導体関連が上昇、エヌビディア決算に注目",
-        "防衛費増額で関連銘柄に関心",
-        "ドル円、円安進行で輸出関連に追い風観測",
-        "長期金利上昇、銀行株の動向に関心",
+        "半導体関連が上昇、エヌビディア決算に注目集まる",
+        "防衛費増額の方針、関連銘柄に関心",
+        "ドル円、円安進行で輸出関連に関心",
+        "長期金利が上昇、銀行株の動向に注目",
+        "原油価格が上昇、商社・資源関連が話題",
     ]
     ctx = analyze(sample, {"ドル円": {"change_pct": 0.4}, "NASDAQ": {"change_pct": 0.5},
                            "S&P500": {"change_pct": 0.3}})
-    import json
-    print(json.dumps(ctx, ensure_ascii=False, indent=2))
-    print("防衛|重工 →", stock_news_line(ctx, ["防衛", "重工"]))
-    print("半導体 →", stock_news_ratio(ctx, ["半導体", "AI"]))
+    print(json.dumps({k: ctx[k] for k in ("major_themes", "positive_theme_tags",
+          "caution_theme_tags", "market_summary")}, ensure_ascii=False, indent=2))
+    print("\n防衛/重工:", build_stock_news_comment(["防衛", "重工"], "機械", "防衛・宇宙・エネルギー", ctx, detailed=True))
+    print("relevance:", calculate_macro_relevance_score(["防衛", "重工"], "機械", "防衛・宇宙", ctx))

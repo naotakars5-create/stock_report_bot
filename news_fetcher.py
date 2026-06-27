@@ -14,12 +14,24 @@ news_fetcher.py
   これらは取得できる範囲のみ利用し、取れなければスキップする。
 """
 
+import re
 import xml.etree.ElementTree as ET
 
 try:
     import requests
 except ImportError:  # pragma: no cover
     requests = None
+
+
+# 見出しのざっくり分類（カテゴリ）に使うキーワード
+CATEGORY_KEYWORDS = {
+    "海外市場": ["NASDAQ", "ナスダック", "ダウ", "S&P", "米国株", "米株", "NY"],
+    "為替・金利": ["円安", "円高", "ドル円", "為替", "金利", "利上げ", "利下げ", "日銀", "FRB"],
+    "商品・資源": ["原油", "WTI", "金価格", "資源", "LNG", "天然ガス", "レアアース", "非鉄"],
+    "政治・地政学": ["防衛", "地政学", "選挙", "政権", "中東", "ウクライナ", "台湾", "制裁"],
+    "半導体・テクノロジー": ["半導体", "AI", "データセンター", "チップ", "サイバー"],
+    "国内企業・産業": ["決算", "増益", "減益", "上方修正", "受注", "新製品", "提携", "買収"],
+}
 
 
 # 取得元 RSS（APIキー不要）。Google ニュースの「ビジネス」トピックと、
@@ -56,6 +68,27 @@ def _parse_rss_titles(xml_text):
     return titles
 
 
+def _dedup_key(title):
+    """重複判定用に、空白・記号を落として正規化したキーを作る。"""
+    return re.sub(r"[\s　、。・「」『』（）()\[\]【】！？!?\-—–:：]", "", title)
+
+
+def categorize_headlines(headlines):
+    """見出しをざっくりカテゴリに分類した {カテゴリ: [見出し,...]} を返す。"""
+    cats = {c: [] for c in CATEGORY_KEYWORDS}
+    cats["その他"] = []
+    for h in headlines or []:
+        placed = False
+        for cat, kws in CATEGORY_KEYWORDS.items():
+            if any(k in h for k in kws):
+                cats[cat].append(h)
+                placed = True
+                break
+        if not placed:
+            cats["その他"].append(h)
+    return {c: v for c, v in cats.items() if v}
+
+
 def fetch_headlines(max_items=40, timeout=10, feeds=None):
     """
     経済・世界情勢ニュースの見出しを取得して文字列リストで返す。
@@ -86,7 +119,7 @@ def fetch_headlines(max_items=40, timeout=10, feeds=None):
             for t in titles:
                 # Google ニュースは "見出し - 媒体名" の形式が多いので媒体名を落とす
                 head = t.rsplit(" - ", 1)[0].strip() if " - " in t else t
-                key = head
+                key = _dedup_key(head)
                 if key and key not in seen:
                     seen.add(key)
                     headlines.append(head)

@@ -102,6 +102,23 @@ def load_profiles(csv_path=DEFAULT_PATH):
     return profiles
 
 
+def tags_from_business(business_summary):
+    """事業内容の文章から、語彙(THEME_VOCAB)に含まれるテーマタグを抽出する。"""
+    if not business_summary:
+        return []
+    return [v for v in THEME_VOCAB if v in business_summary]
+
+
+def _merge_tags(*tag_lists):
+    """複数のタグリストを順序を保って重複なく結合する。"""
+    out = []
+    for tags in tag_lists:
+        for t in tags or []:
+            if t not in out:
+                out.append(t)
+    return out
+
+
 def themes_from_sector(sector):
     """業種名からテーマタグを推定する。"""
     if not sector:
@@ -130,19 +147,24 @@ def get_profile(code, name="", sector="", profiles=None):
             merged["sector"] = sector
         if not merged.get("name"):
             merged["name"] = name
-        if not merged.get("theme_tags"):
-            merged["theme_tags"] = themes_from_sector(merged.get("sector") or sector)
         if not merged.get("business_summary"):
             merged["business_summary"] = f"{merged.get('sector') or sector}に属する企業"
+        # CSVのタグ＋業種推定＋事業内容から抽出したタグを統合（順序維持・重複なし）
+        merged["theme_tags"] = _merge_tags(
+            merged.get("theme_tags"),
+            themes_from_sector(merged.get("sector") or sector),
+            tags_from_business(merged.get("business_summary")),
+        )
         return merged
 
     # 未登録 → 業種から自動生成
+    business = f"{sector}に属する企業" if sector else "事業内容の登録なし"
     return {
         "code": code,
         "name": name,
         "sector": sector,
-        "business_summary": f"{sector}に属する企業" if sector else "事業内容の登録なし",
-        "theme_tags": themes_from_sector(sector),
+        "business_summary": business,
+        "theme_tags": _merge_tags(themes_from_sector(sector), tags_from_business(business)),
         "size_category": "",
         "notes": "",
         "source": "auto",

@@ -270,12 +270,9 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
         reasons.append("テーマ性: " + "・".join(theme_tags[:3]))
 
     # 5. ニュース環境・マクロテーマ評価（世界情勢・経済ニュースとの関連。中立は0.5）
+    #    詳しい関連理由・注意点・解説は report_writer 側で macro_reason 等から生成する。
     nr = 0.5 if news_ratio is None else _clamp(news_ratio)
     details["ニュース"] = nr * WEIGHTS["ニュース"]
-    if news_ratio is not None and news_ratio >= 0.65:
-        reasons.append("ニュース環境: " + (news_line or "関連テーマが意識されやすい環境"))
-    elif news_ratio is not None and news_ratio <= 0.4:
-        risks.append("ニュース環境: " + (news_line or "関連テーマに逆風の可能性に注意"))
 
     # 6. バリュエーション評価（取得不可は中立）
     details["割安感"] = _valuation_ratio(valuation) * WEIGHTS["割安感"]
@@ -364,9 +361,20 @@ def score_all(stock_histories, benchmark_df=None, top_n=5,
         code = item["code"]
         prof = profiles.get(code) or {}
         tags = prof.get("theme_tags") or []
-        # ニュース環境（macro_context が無ければ中立）
-        news_ratio = macro_analyzer.stock_news_ratio(macro_context, tags) if macro_context else None
-        news_line = macro_analyzer.stock_news_line(macro_context, tags) if macro_context else None
+        sector = item.get("sector", "")
+        business = prof.get("business_summary", "")
+        # ニュース環境（macro_context が無ければ中立）。銘柄ごとの関連スコア・解説を作る。
+        if macro_context:
+            rel = macro_analyzer.calculate_macro_relevance_score(
+                tags, sector, business, macro_context)
+            news_ratio = rel.get("macro_score")
+            news_line = macro_analyzer.build_stock_news_comment(
+                tags, sector, business, macro_context, detailed=False)
+            news_detail = macro_analyzer.build_stock_news_comment(
+                tags, sector, business, macro_context, detailed=True)
+        else:
+            rel = {"macro_reason": None, "macro_caution": None}
+            news_ratio = news_line = news_detail = None
         result = score_stock(
             item["history"],
             benchmark_close=benchmark_close,
@@ -382,9 +390,12 @@ def score_all(stock_histories, benchmark_df=None, top_n=5,
         scored.append({
             "code": code,
             "name": item["name"],
-            "sector": item.get("sector", ""),
-            "business_summary": prof.get("business_summary", ""),
+            "sector": sector,
+            "business_summary": business,
             "profile_source": prof.get("source", ""),
+            "macro_reason": rel.get("macro_reason"),
+            "macro_caution": rel.get("macro_caution"),
+            "news_detail": news_detail,
             "size_category": result.get("size_category") or prof.get("size_category", ""),
             **{k: v for k, v in result.items() if k != "size_category"},
         })
