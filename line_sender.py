@@ -126,24 +126,30 @@ def _post_batches(messages, headers, user_id, timeout, label):
     return ok
 
 
-def send_report(report, flex_messages=None, token=None, user_id=None, timeout=30):
+def send_report(followup_text, flex_messages=None, fallback_text=None,
+                token=None, user_id=None, timeout=30):
     """
-    レポートをLINEへPush送信する。
+    レポートをLINEへ「カード中心」で Push 送信する。
 
-    送信順:
-        1. Flexメッセージ（まとめカード → 銘柄カルーセル）
-        2. テキストの詳細レポート
+    通常の送信順:
+        1. サマリーFlexカード
+        2. 銘柄別Carousel Flexカード
+        3. 短い補足テキスト（ニュース／テーマ／検証のみ・カードと重複しない）
 
-    Flexメッセージの送信に失敗した場合でも、テキストの詳細レポートは必ず送信する
-    （＝通常テキスト送信へのフォールバック）。テキストにも評価バランス図を含むため、
-    Flexが崩れても情報は失われない。
+    Flexメッセージの送信に成功した場合は、銘柄詳細はカードに集約されているため
+    テキストは「短い補足テキスト」だけを送る（長文の詳細テキストは送らない）。
+
+    Flexメッセージの送信に失敗した場合のみ、カードが届かない分を補う短縮テキスト
+    （fallback_text: 上位銘柄の概要＋補足）にフォールバックする。フォールバック時も
+    長文にはせず、補足テキスト側で最大1500字に収めている。
 
     引数:
-        report: 送信する本文（注意書き・評価バランス図を含む完成済みレポート）
-        flex_messages: [(alt_text, contents), ...] のリスト（まとめカード・カルーセル等）
+        followup_text: カードの後に送る短い補足テキスト（最大1500字）
+        flex_messages: [(alt_text, contents), ...]（サマリーカード・銘柄カルーセル）
+        fallback_text: Flex送信失敗時のみ使う短縮テキスト（無ければ followup_text）
         token / user_id: 明示指定が無ければ環境変数から取得
     戻り値:
-        "sent"    : 必要なメッセージ（最低限テキスト）を送信できた
+        "sent"    : 必要なメッセージを送信できた
         "skipped" : 環境変数未設定などで送信せずスキップ
         "failed"  : テキストも含めて送信できなかった
     例外は送出しない（全体を止めない）。
@@ -173,28 +179,34 @@ def send_report(report, flex_messages=None, token=None, user_id=None, timeout=30
         {"type": "flex", "altText": alt_text, "contents": contents}
         for alt_text, contents in (flex_messages or [])
     ]
-    text_msgs = [{"type": "text", "text": c} for c in split_message(report)]
 
-    if not flex_msgs and not text_msgs:
+    if not flex_msgs and not (followup_text or "").strip():
         print("[LINE] 送信する内容が空のためスキップします。")
         return "skipped"
 
-    # 1. Flexメッセージ（まとめカード＋カルーセル）。失敗してもテキストは送る。
+    # 1. Flexメッセージ（サマリーカード＋銘柄カルーセル）
     flex_ok = True
     if flex_msgs:
         flex_ok = _post_batches(flex_msgs, headers, user_id, timeout, "Flexカード")
-        if not flex_ok:
-            print("[LINE] Flexメッセージの送信に失敗したため、"
-                  "テキストレポートへフォールバックします。")
 
-    # 2. テキストの詳細レポート（フォールバック先でもある）
-    text_ok = _post_batches(text_msgs, headers, user_id, timeout, "テキスト")
+    # 2. テキスト送信。Flex成功時は短い補足テキスト、失敗時のみ短縮フォールバック。
+    if flex_ok:
+        text_to_send = followup_text
+    else:
+        print("[LINE] Flexメッセージの送信に失敗したため、"
+              "短縮テキストへフォールバックします。")
+        text_to_send = fallback_text or followup_text
+
+    text_label = "補足テキスト" if flex_ok else "短縮テキスト"
+    text_msgs = [{"type": "text", "text": c}
+                 for c in split_message(text_to_send or "")]
+    text_ok = _post_batches(text_msgs, headers, user_id, timeout, text_label)
 
     if flex_ok and text_ok:
         print("[LINE] すべてのメッセージを送信しました。")
         return "sent"
     if text_ok:
-        print("[LINE] Flexは一部失敗しましたが、テキストレポートは送信しました。")
+        print("[LINE] Flexは一部失敗しましたが、短縮テキストは送信しました。")
         return "sent"
-    print("[LINE] テキストレポートの送信にも失敗しました（処理は継続します）。")
+    print("[LINE] テキストの送信にも失敗しました（処理は継続します）。")
     return "failed"

@@ -8,10 +8,19 @@ report_writer.py
   使うためのレポートです。**特定銘柄の売買を推奨するものではありません。**
   「おすすめ株」ではなく「スクリーニング上位銘柄」を提示します。
 
+LINE配信は「カード中心」の構成です:
+  1. build_flex_message()  : サマリーカード（集計・市場概況・テーマ・上位5・検証）
+  2. build_stock_cards()   : 上位5銘柄の横スライドカード（銘柄詳細はここに集約）
+  3. build_followup_text() : 短い補足テキスト（ニュース／テーマ／検証のみ・最大1500字）
+
 提供するもの:
-  - build_report()        : 詳細レポート（ターミナル表示・LINEテキスト用／評価バランス図つき）
-  - build_flex_message()  : LINE Flexの「まとめカード」（1分で読める短縮版）
-  - analyze_trend()       : 市場全体トレンドの機械的サマリー
+  - build_flex_message()   : LINE Flexの「サマリーカード」（1分で読める短縮版）
+  - build_stock_cards()    : 銘柄別の横スライドカルーセル（銘柄詳細を集約）
+  - build_followup_text()  : カードと重複しない短い補足テキスト（LINE用）
+  - build_fallback_text()  : Flex送信失敗時のみ使う短縮テキスト（銘柄概要＋補足）
+  - build_report()         : 長文の詳細レポート。**LINEでは送らず**、ターミナル表示
+                             および将来のWeb版／PDF版用に残している
+  - analyze_trend()        : 市場全体トレンドの機械的サマリー
 """
 
 from datetime import datetime
@@ -550,9 +559,148 @@ def _validation_summary_lines(validations):
     return out
 
 
+# ====== 短い補足テキスト（LINE用・カードと重複しない） ======
+def _clip_text(text, limit):
+    """LINEで読みやすいよう、上限文字数で安全に丸める。"""
+    if text is None:
+        return ""
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _followup_macro_bullets(market, scored_stocks, stats, macro_context):
+    """補足テキスト用のマクロ環境（2〜4行）。重複（部分一致含む）を避け、短い文だけを採る。"""
+    mc = macro_context or {}
+    bullets = []
+
+    def _add(v):
+        v = (v or "").strip()
+        if not v:
+            return
+        # 既存の文に含まれる／既存の文を含む場合は重複とみなしてスキップ。
+        # （market_summary が us/fx コメントを連結していることがあるため）
+        for b in bullets:
+            if v in b or b in v:
+                return
+        bullets.append(v)
+
+    _add(mc.get("market_summary"))
+    for key in ("us_market_comment", "fx_comment", "commodity_comment",
+                "geopolitical_comment"):
+        _add(mc.get(key))
+    if not bullets:
+        _add(analyze_trend(market, scored_stocks, stats)["headline"] + "。")
+    return bullets[:4]
+
+
+def _followup_validation_text(validations):
+    """補足テキスト用の検証結果（最大3期間・勝敗／平均／市場比のみ・銘柄別は出さない）。"""
+    validations = [v for v in (validations or []) if v]
+    if not validations:
+        return "検証データは蓄積中です（次回以降に表示します）。"
+    blocks = []
+    for v in validations[:3]:
+        if v["label"] == "前回":
+            head = f"前回上位{v['total']}銘柄：{v['wins']}勝{v['losses']}敗"
+        else:
+            head = f"{v['label']}：{v['wins']}勝{v['losses']}敗"
+        lines = [head, f"平均騰落率：{_fmt_pct(v['avg_return'])}"]
+        if v.get("vs_nikkei") is not None:
+            lines.append(f"日経平均比：{v['vs_nikkei']:+.2f}pt")
+        elif v.get("vs_topix") is not None:
+            lines.append(f"TOPIX比：{v['vs_topix']:+.2f}pt")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _followup_sections(market, scored_stocks, stats, validations,
+                       macro_context, theme_ranking):
+    """補足テキストの本文セクション（ニュース／今日強いテーマ／テーマ別確認銘柄／検証）。"""
+    lines = []
+    lines.append("■ 今日のニュース・マクロ環境")
+    for b in _followup_macro_bullets(market, scored_stocks, stats, macro_context):
+        lines.append(f"・{b}")
+    lines.append("")
+
+    lines.append("■ 今日強いテーマ")
+    if theme_ranking:
+        for i, t in enumerate(theme_ranking[:5], start=1):
+            lines.append(f"{i}. {t['theme']}")
+    else:
+        lines.append("（テーマ集計は蓄積中です）")
+    lines.append("")
+
+    lines.append("■ テーマ別確認銘柄")
+    rows = []
+    for t in (theme_ranking or [])[:5]:
+        names = "、".join(x["name"] for x in t["stocks"][:3])
+        if names:
+            rows.append(f"{t['theme']}：{names}")
+    lines.extend(rows or ["（集計は蓄積中です）"])
+    lines.append("")
+
+    lines.append("■ 検証結果")
+    lines.append(_followup_validation_text(validations))
+    return lines
+
+
+def build_followup_text(market, scored_stocks, stats=None, validations=None,
+                        macro_context=None, theme_ranking=None, now_str=None):
+    """
+    カードの後に送る「短い補足テキスト」（最大1500字・目安1000字以内）。
+
+    銘柄ごとの詳細（評価グラフ・加点/減点・ニュース環境・リスクメモ）は
+    すべて横スライドカードに集約しているため、ここでは繰り返さない。
+    含めるのは: 今日のニュース・マクロ環境／今日強いテーマ／テーマ別確認銘柄／検証結果。
+    """
+    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    parts = ["【補足レポート】", f"{SUBTITLE} ・ {now_str}", ""]
+    parts.extend(_followup_sections(
+        market, scored_stocks, stats, validations, macro_context, theme_ranking))
+    parts.append("")
+    parts.append("※本レポートは公開データをもとにした機械的なスクリーニング結果であり、"
+                 "特定銘柄の売買を推奨するものではありません。")
+    return _clip_text("\n".join(parts), 1500)
+
+
+def build_fallback_text(market, scored_stocks, stats=None, validations=None,
+                        macro_context=None, theme_ranking=None, now_str=None):
+    """
+    Flexカードの送信に失敗したときだけ使う短縮テキスト。
+
+    カードが届かないため、上位銘柄を1行ずつ（名称・コード・評価点・テーマ）だけ補い、
+    続けて補足テキスト本文を載せる。長文にはせず、最大1500字に収める。
+    """
+    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    parts = [f"【{TITLE}】（カード表示の代替・短縮版）",
+             f"{SUBTITLE} ・ {now_str}", ""]
+    parts.append(f"■ スクリーニング上位{len(scored_stocks)}銘柄")
+    if scored_stocks:
+        for i, s in enumerate(scored_stocks, start=1):
+            _en, ja = _rank_label(s["score"])
+            parts.append(f"{i}. {s['name']}（{s['code']}） {s['score']:.1f}/10・{ja}")
+            tags = _theme_line(s)
+            if tags and tags != "—":
+                parts.append(f"   テーマ：{tags}")
+    else:
+        parts.append("条件を満たす銘柄は今回ありませんでした。")
+    parts.append("")
+    parts.extend(_followup_sections(
+        market, scored_stocks, stats, validations, macro_context, theme_ranking))
+    parts.append("")
+    parts.append("※公開データをもとにした機械的なスクリーニング結果であり、"
+                 "特定銘柄の売買を推奨するものではありません。")
+    return _clip_text("\n".join(parts), 1500)
+
+
 def build_report(market, scored_stocks, stats=None, validations=None,
                  macro_context=None, theme_ranking=None):
-    """詳細レポート全文（ターミナル表示・LINEテキスト用）。"""
+    """
+    長文の詳細レポート全文（ターミナル表示・将来のWeb版／PDF版用）。
+
+    注意: **LINE配信では使用しない**。LINEはカード中心（サマリーカード＋銘柄カルーセル
+    ＋短い補足テキスト build_followup_text()）で構成し、銘柄詳細はカードに集約する。
+    この関数はターミナルでの確認用、および将来の別チャネル（Web/PDF）向けに残している。
+    """
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
     parts = [f"【{TITLE}】", SUBTITLE, now, "", DESCRIPTION, ""]
 
@@ -919,7 +1067,7 @@ def _stock_bubble(rank, s, macro_context=None):
         "backgroundColor": "#FAFAFB", "contents": [
             _flex_text("※売買推奨ではありません（公開データをもとにした機械的な抽出結果）",
                        size="xxs", color="#9AA0A6", wrap=True),
-            _flex_text("詳細はテキストレポートをご参照ください",
+            _flex_text("← → 横スライドで他の銘柄も確認できます",
                        size="xxs", color="#B0B5BB", wrap=True),
         ],
     }

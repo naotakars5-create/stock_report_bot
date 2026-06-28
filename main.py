@@ -14,7 +14,8 @@ main.py
   4. 【二次スクリーニング】通過銘柄を 7軸でスコアリング → 上位5銘柄を抽出
      （事業内容・テーマ性・流動性・バリュエーション・前回継続性を加味）
   5. 前回レポートの検証（前回上位銘柄のその後の推移を機械的に集計）
-  6. レポートをターミナル出力 ＋ LINE配信（まとめカード＋詳細テキスト）
+  6. レポートをターミナル出力 ＋ LINE配信（カード中心：サマリーカード＋
+     銘柄カルーセル＋短い補足テキスト。長文レポートはLINEには送らない）
   7. 今回の抽出結果を履歴に保存（次回の検証用）
 """
 
@@ -231,10 +232,18 @@ def main():
     # 5. 過去レポートの検証（前回・3営業日前・1週間前を、データがある範囲で）
     validations = _build_validations(price_map, nikkei_df, benchmark_df, today_str)
 
-    # 6. レポート出力
-    #    LINE送信順: (1)全体サマリーカード → (2)上位5銘柄の横スライドカード
-    #              → (3)詳細テキストレポート
+    # 6. レポート出力（LINEは「カード中心」）
+    #    LINE送信順: (1)サマリーカード → (2)上位5銘柄の横スライドカード
+    #              → (3)短い補足テキスト（ニュース／テーマ／検証のみ）
+    #    銘柄ごとの詳細はカードに集約し、補足テキストでは繰り返さない。
+    #    長文レポート(build_report)はターミナル確認・将来のWeb/PDF用で、LINEには送らない。
     report = report_writer.build_report(
+        market, scored_stocks, stats, validations=validations,
+        macro_context=macro_context, theme_ranking=theme_ranking)
+    followup_text = report_writer.build_followup_text(
+        market, scored_stocks, stats, validations=validations,
+        macro_context=macro_context, theme_ranking=theme_ranking)
+    fallback_text = report_writer.build_fallback_text(
         market, scored_stocks, stats, validations=validations,
         macro_context=macro_context, theme_ranking=theme_ranking)
     flex_messages = [
@@ -246,8 +255,10 @@ def main():
     if cards:
         flex_messages.append(cards)
     print()
-    print(report)
-    _deliver(report, flex_messages)
+    print(report)  # ターミナル表示のみ（LINEには送らない長文レポート）
+    print("\n--- LINE補足テキスト（実際に送信する短縮版）---")
+    print(followup_text)
+    _deliver(followup_text, flex_messages, fallback_text)
 
     # 7. 今回の抽出結果を履歴に保存（次回の検証用）
     if scored_stocks:
@@ -256,13 +267,15 @@ def main():
     return 0
 
 
-def _deliver(report, flex_messages=None):
+def _deliver(followup_text, flex_messages=None, fallback_text=None):
     """
-    レポートをLINEへ送信する（まとめカード＋詳細テキスト）。
+    レポートをLINEへ送信する（サマリーカード＋銘柄カルーセル＋短い補足テキスト）。
+    Flex送信に失敗した場合のみ、短縮テキスト(fallback_text)へフォールバックする。
     環境変数が未設定ならスキップ、失敗しても全体は止めない。
     """
     try:
-        line_sender.send_report(report, flex_messages=flex_messages)
+        line_sender.send_report(
+            followup_text, flex_messages=flex_messages, fallback_text=fallback_text)
     except Exception as e:
         print(f"[警告] LINE送信処理で予期せぬエラー（処理は継続）: {e}")
 
