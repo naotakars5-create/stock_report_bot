@@ -385,6 +385,20 @@ def calculate_macro_relevance_score(theme_tags, sector, business_summary, macro_
             "matched_positive": [t for t, _ in pos], "matched_caution": [t for t, _ in cau]}
 
 
+def _business_hook(business_summary, limit=28):
+    """事業内容から、コメントに差し込む短い事業表現を作る。"""
+    if not business_summary:
+        return ""
+    b = business_summary.split("。")[0].split("（")[0].strip()
+    for suf in ("を展開する企業", "を展開", "を手がける企業", "を手がける",
+                "の世界大手", "の最大手", "の大手", "の企業"):
+        if b.endswith(suf):
+            b = b[: -len(suf)]
+            break
+    b = b.strip("、 ")
+    return b if len(b) <= limit else b[:limit] + "…"
+
+
 def build_stock_news_comment(theme_tags, sector, business_summary, macro_context, detailed=False):
     """
     銘柄ごとの「ニュース環境」解説（2〜3文）。theme_tags・sector・business_summary と
@@ -402,10 +416,14 @@ def build_stock_news_comment(theme_tags, sector, business_summary, macro_context
     env = NEWS_ENV.get(theme, f"{theme}関連の報道が増える局面")
     related = _related_tags_for_theme(theme_tags, theme) or (theme_tags or [])[:2]
     tagstr = "・".join(dict.fromkeys(related))[:40] or (sector or "同社の事業")
+    hook = _business_hook(business_summary)
 
     sentences = [f"{env}では、{tagstr}を持つ同社は市場の関心対象になりやすい。"]
-    if detailed and business_summary:
-        sentences.append(f"事業は「{business_summary}」で、{theme}関連の話題との接点がある。")
+    if hook:
+        if detailed:
+            sentences.append(f"同社は{hook}を手がけており、{theme}関連の話題との接点がある。")
+        else:
+            sentences.append(f"同社は{hook}を手がけテーマ接点がある。")
     elif len(pos) > 1:
         sentences.append(f"{pos[1][0]}の動向とも関連しやすい。")
 

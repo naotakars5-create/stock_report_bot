@@ -109,6 +109,15 @@ def tags_from_business(business_summary):
     return [v for v in THEME_VOCAB if v in business_summary]
 
 
+def _auto_business(sector, theme_tags):
+    """CSV未登録の銘柄向けに、業種・テーマから自然な事業説明を生成する。"""
+    base = f"{sector}領域で事業を展開する企業" if sector else "事業内容を確認中の企業"
+    tags = [t for t in (theme_tags or []) if t]
+    if tags:
+        return base + f"（{'・'.join(tags[:3])}テーマと接点）"
+    return base
+
+
 def _merge_tags(*tag_lists):
     """複数のタグリストを順序を保って重複なく結合する。"""
     out = []
@@ -147,24 +156,26 @@ def get_profile(code, name="", sector="", profiles=None):
             merged["sector"] = sector
         if not merged.get("name"):
             merged["name"] = name
-        if not merged.get("business_summary"):
-            merged["business_summary"] = f"{merged.get('sector') or sector}に属する企業"
         # CSVのタグ＋業種推定＋事業内容から抽出したタグを統合（順序維持・重複なし）
         merged["theme_tags"] = _merge_tags(
             merged.get("theme_tags"),
             themes_from_sector(merged.get("sector") or sector),
             tags_from_business(merged.get("business_summary")),
         )
+        if not merged.get("business_summary"):
+            merged["business_summary"] = _auto_business(
+                merged.get("sector") or sector, merged["theme_tags"])
         return merged
 
-    # 未登録 → 業種から自動生成
-    business = f"{sector}に属する企業" if sector else "事業内容の登録なし"
+    # 未登録 → 業種・テーマから自然な事業説明を自動生成
+    sector_tags = themes_from_sector(sector)
+    business = _auto_business(sector, sector_tags)
     return {
         "code": code,
         "name": name,
         "sector": sector,
         "business_summary": business,
-        "theme_tags": _merge_tags(themes_from_sector(sector), tags_from_business(business)),
+        "theme_tags": _merge_tags(sector_tags, tags_from_business(business)),
         "size_category": "",
         "notes": "",
         "source": "auto",

@@ -16,10 +16,16 @@ stock_scorer.py
 注意: これは「売買推奨」ではなく、公開データに基づく機械的なスクリーニングです。
 """
 
+import statistics
+
 import pandas as pd
 
 import macro_analyzer
 from profile_loader import HIGH_ATTENTION_THEMES
+
+
+# 評価グラフ（バランス図）に出す軸。表示は相対スケールで強弱を出す。
+DISPLAY_AXES = ["トレンド", "出来高", "相対強度", "テーマ性", "ニュース", "割安感", "安定性"]
 
 
 # 各評価軸の配点（合計 = 10.0）
@@ -338,8 +344,35 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
     }
 
 
-def score_all(stock_histories, benchmark_df=None, top_n=5,
-              profiles=None, valuations=None, previous_codes=None, macro_context=None):
+def compute_theme_ranking(scored, top_themes=6, per_theme=3):
+    """
+    候補銘柄を theme_tags 別に集計し、強いテーマのランキングを作る。
+
+    戻り値: [{"theme", "count", "avg_score", "stocks":[{name,code,score}, ...]}, ...]
+    （count 降順 → 平均スコア降順）。
+    """
+    buckets = {}
+    for s in scored:
+        for t in (s.get("theme_tags") or []):
+            buckets.setdefault(t, []).append(s)
+    ranking = []
+    for theme, members in buckets.items():
+        members_sorted = sorted(members, key=lambda x: x.get("score", 0), reverse=True)
+        avg = sum(x.get("score", 0) for x in members) / len(members)
+        ranking.append({
+            "theme": theme,
+            "count": len(members),
+            "avg_score": avg,
+            "stocks": [{"name": x.get("name", ""), "code": x.get("code", ""),
+                        "score": x.get("score", 0)} for x in members_sorted[:per_theme]],
+        })
+    ranking.sort(key=lambda r: (r["count"], r["avg_score"]), reverse=True)
+    return ranking[:top_themes]
+
+
+def score_all(stock_histories, benchmark_df=None, top_n=5, profiles=None,
+              valuations=None, previous_codes=None, macro_context=None,
+              theme_ranking_out=None):
     """
     全候補銘柄をスコアリングし、評価点 MIN_FINAL_SCORE 以上の上位 top_n 件を返す。
 
@@ -400,6 +433,45 @@ def score_all(stock_histories, benchmark_df=None, top_n=5,
             **{k: v for k, v in result.items() if k != "size_category"},
         })
 
+    # 評価グラフ用の相対スコア（候補全体の分布に対する強弱）を付与してから絞り込む
+    _attach_display_ratios(scored)
+
+    # テーマ別ランキング（候補全体から集計。呼び出し側が out リストを渡したとき）
+    if theme_ranking_out is not None:
+        theme_ranking_out.extend(compute_theme_ranking(scored))
+
     scored = [s for s in scored if s["score"] >= MIN_FINAL_SCORE]
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:top_n]
+
+
+def _attach_display_ratios(scored):
+    """
+    各銘柄の評価グラフ表示用に、軸ごとの相対スコア(0〜1)を付与する。
+
+    候補全体の平均・標準偏差で標準化し、平均=0.5中心に強弱を広げる。
+    総合スコア自体は変えず、内訳グラフの見え方にメリハリを出すための表示用変換。
+    分散が無い軸は絶対値（獲得点÷満点）をそのまま使う。
+    """
+    if not scored:
+        return
+    stats = {}
+    for a in DISPLAY_AXES:
+        w = WEIGHTS.get(a) or 1.0
+        vals = [s.get("details", {}).get(a, 0) / w for s in scored]
+        mean = sum(vals) / len(vals)
+        sd = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+        stats[a] = (mean, sd)
+    for s in scored:
+        details = s.get("details", {})
+        disp = {}
+        for a in DISPLAY_AXES:
+            w = WEIGHTS.get(a) or 1.0
+            r = details.get(a, 0) / w
+            mean, sd = stats[a]
+            if sd < 1e-6:
+                disp[a] = max(0.06, min(1.0, r))
+            else:
+                z = (r - mean) / sd
+                disp[a] = max(0.06, min(1.0, 0.5 + z * 0.20))
+        s["display_ratios"] = disp

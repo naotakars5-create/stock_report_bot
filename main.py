@@ -20,6 +20,7 @@ main.py
 
 import os
 import sys
+from datetime import datetime
 
 # Windows のコンソールが Shift-JIS の場合に日本語が文字化けするのを防ぐため、
 # 標準出力・標準エラーを UTF-8 に再設定する（Python 3.7+）。
@@ -103,6 +104,20 @@ def _fetch_valuations(detail_histories):
     return valuations
 
 
+def _build_validations(current_prices, nikkei_df, benchmark_df, today_str):
+    """過去の上位5銘柄を、前回・3営業日前・1週間前の各回でデータがある範囲で検証する。"""
+    runs = report_history.load_runs(before_date=today_str)
+    validations = []
+    for label, run, _age in report_history.select_horizon_runs(runs, today=today_str):
+        nk = report_history.benchmark_return(nikkei_df, run["run_date"])
+        tx = report_history.benchmark_return(benchmark_df, run["run_date"])
+        v = report_history.build_validation(
+            run, current_prices, nikkei_pct=nk, topix_pct=tx, label=label)
+        if v:
+            validations.append(v)
+    return validations
+
+
 def main():
     print("=" * 60)
     print("日本株 朝のスクリーニング速報（東証スクリーニング版）を開始します")
@@ -153,17 +168,21 @@ def main():
     if not macro_context.get("available"):
         print("[情報] ニュース取得が一部制限されています（ニュース評価は中立扱い）。")
 
-    # 2. 市場平均(TOPIX連動ETF)の履歴（相対強度の基準）
+    # 2. 市場平均(TOPIX連動ETF)・日経平均の履歴（相対強度・検証の市場比に使用）
     benchmark_df = data_fetcher.get_benchmark_history()
     if benchmark_df is None:
         print("[警告] 市場平均(TOPIX連動ETF)の履歴が取得できませんでした。"
               "相対強度は中立扱いになります。")
+    nikkei_df = data_fetcher.get_nikkei_history()
 
-    # 前回レポート（検証用）を先に読み込む
-    previous = report_history.load_previous()
+    # 過去レポート（検証用）を先に読み込む（当日を含めない）
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    previous = report_history.load_previous(before_date=today_str)
     previous_codes = set()
     if previous:
         previous_codes = {(e.get("code") or "").strip() for e in previous["entries"]}
+
+    theme_ranking = []  # テーマ別ランキング（score_all が候補全体から集計して埋める）
 
     # 3. 一次スクリーニング
     print("\n■ 一次スクリーニング（全候補を軽量データでふるい分け）")
@@ -203,26 +222,25 @@ def main():
         scored_stocks = stock_scorer.score_all(
             detail_histories, benchmark_df=benchmark_df, top_n=FINAL_TOP_N,
             profiles=profiles_map, valuations=valuations, previous_codes=previous_codes,
-            macro_context=macro_context,
+            macro_context=macro_context, theme_ranking_out=theme_ranking,
         )
     else:
         print("[情報] 一次スクリーニングを通過した銘柄はありませんでした。")
     stats["final"] = len(scored_stocks)
 
-    # 5. 前回レポートの検証
-    validation = None
-    if previous:
-        bench_pct = report_history.benchmark_return(benchmark_df, previous["run_date"])
-        validation = report_history.build_validation(previous, price_map, bench_pct)
+    # 5. 過去レポートの検証（前回・3営業日前・1週間前を、データがある範囲で）
+    validations = _build_validations(price_map, nikkei_df, benchmark_df, today_str)
 
     # 6. レポート出力
     #    LINE送信順: (1)全体サマリーカード → (2)上位5銘柄の横スライドカード
     #              → (3)詳細テキストレポート
     report = report_writer.build_report(
-        market, scored_stocks, stats, validation=validation, macro_context=macro_context)
+        market, scored_stocks, stats, validations=validations,
+        macro_context=macro_context, theme_ranking=theme_ranking)
     flex_messages = [
         report_writer.build_flex_message(
-            market, scored_stocks, stats, validation=validation, macro_context=macro_context)
+            market, scored_stocks, stats, validations=validations,
+            macro_context=macro_context, theme_ranking=theme_ranking)
     ]
     cards = report_writer.build_stock_cards(scored_stocks, macro_context=macro_context)
     if cards:

@@ -210,48 +210,109 @@ def _reason_caution(s):
     return s.get("macro_caution") or _first_meaningful_risk(s) or "短期的な過熱感には注意"
 
 
-def generate_score_reason(s, macro_context=None):
-    """
-    評価点の根拠を4要素（テクニカル／出来高／ニュース・テーマ／注意点）で生成する。
-
-    「買い」「上昇予想」等の売買推奨表現は使わず、銘柄ごとに数値・固有テーマを反映する。
-    戻り値: 文字列のリスト（カードでは「・」付きで箇条書き表示。最大4行）。
-    """
-    return [
-        _reason_technical(s),
-        _reason_volume(s),
-        _reason_news(s),
-        "一方で、" + _reason_caution(s),
-    ]
+def _disp(s, axis):
+    """表示用の相対スコア(0〜1)。無ければ絶対値(獲得点÷満点)。"""
+    d = s.get("display_ratios") or {}
+    return d.get(axis, _axis_ratio(s, axis))
 
 
-def generate_score_reason_text(s):
-    """詳細テキスト用の評価理由（3〜5文の散文）。銘柄ごとに内容を変える。"""
+# 評価軸ごとの加点・減点フレーズ
+_AXIS_POS = {
+    "トレンド": "短期・中期トレンドが上向き",
+    "出来高": "出来高が20日平均を上回る",
+    "相対強度": "市場平均(TOPIX)に対して相対的に強い",
+    "テーマ性": "業種テーマ性が評価されている",
+    "ニュース": "ニュース環境との接点がある",
+    "割安感": "PER/PBR等から割高感は限定的",
+    "安定性": "値動きが比較的安定している",
+}
+_AXIS_NEG = {
+    "トレンド": "移動平均の並びが整っていない",
+    "出来高": "出来高は低調で市場の関心は限定的",
+    "相対強度": "市場平均(TOPIX)に対して見劣りする",
+    "テーマ性": "業種テーマ性は限定的",
+    "ニュース": "本日のニュースとの関連は限定的",
+    "割安感": "バリュエーションは割高感がある",
+    "安定性": "安定性スコアが低い（値動きが荒い）",
+}
+_POS_ORDER = ["トレンド", "出来高", "相対強度", "テーマ性", "ニュース", "割安感", "安定性"]
+
+
+def generate_watch_reason(s, macro_context=None):
+    """カード用「今日見る理由」（事業/テーマ＋テクニカル/出来高を最低2要素・1文）。"""
+    tags = s.get("theme_tags") or []
     m = s.get("metrics", {})
-    parts = []
+    vr = m.get("vol_ratio")
+    trend_strong = _disp(s, "トレンド") >= 0.58
+    rel_strong = _disp(s, "相対強度") >= 0.58
+    vol_strong = vr is not None and vr >= 1.2
 
-    g5 = m.get("gap_5_25")
-    if _axis_ratio(s, "トレンド") >= 0.6:
-        gap = f"（5日-25日 {g5:+.1f}%）" if g5 is not None else ""
-        parts.append(f"短期移動平均が中期移動平均を上回り{gap}、トレンド評価は高め。")
+    if tags:
+        head = f"{'・'.join(tags[:3])}テーマとの接点があり"
+    elif s.get("sector"):
+        head = f"{s['sector']}領域の事業を背景に"
     else:
-        parts.append("移動平均の並びは発展途上で、トレンドは中立寄り。")
+        head = "スクリーニング条件を背景に"
 
-    vr, rel = m.get("vol_ratio"), m.get("rel_strength")
-    vb = []
-    if vr is not None:
-        vb.append(f"出来高は20日平均比 約{vr:.1f}倍")
-    if rel is not None:
-        vb.append(f"市場平均(TOPIX)に対し20日で{rel:+.1f}pt")
-    if vb:
-        parts.append("、".join(vb) + "。")
+    if vol_strong and (trend_strong or rel_strong):
+        tail = "出来高増を伴って" + ("短期トレンドが強い" if trend_strong else "相対強度が高い")
+    elif trend_strong:
+        tail = "短期トレンドが強い"
+    elif rel_strong:
+        tail = "相対強度が高い"
+    elif vol_strong:
+        tail = "出来高が増加している"
+    else:
+        tail = "複数の評価軸で条件がそろう"
 
-    mr = s.get("macro_reason")
-    if mr:
-        parts.append(f"ニュース面では、{mr}。")
+    news = "、ニュース環境とも関連" if s.get("macro_reason") else ""
+    return f"{head}、{tail}{news}。"
 
-    parts.append("注意点として、" + _reason_caution(s) + "。")
-    return " ".join(parts)
+
+def positive_reasons(s, macro_context=None):
+    """加点理由（2〜3個）。相対的に強い軸＋ニュース接点から、数値を添えて生成。"""
+    m = s.get("metrics", {})
+    ranked = sorted(((a, _disp(s, a)) for a in _POS_ORDER), key=lambda x: x[1], reverse=True)
+    items = []
+    for a, v in ranked:
+        if v < 0.58:
+            continue
+        phrase = _AXIS_POS[a]
+        if a == "トレンド" and m.get("gap_5_25") is not None:
+            phrase += f"（5日線が25日線を{m['gap_5_25']:+.1f}%）"
+        elif a == "出来高" and m.get("vol_ratio") is not None:
+            phrase += f"（約{m['vol_ratio']:.1f}倍）"
+        elif a == "相対強度" and m.get("rel_strength") is not None:
+            phrase += f"（20日{m['rel_strength']:+.1f}pt）"
+        items.append(phrase)
+        if len(items) >= 3:
+            break
+    if s.get("macro_reason") and len(items) < 3:
+        items.append(s["macro_reason"])
+    return items[:3] or ["総合スコアが抽出水準を満たす"]
+
+
+def negative_reasons(s):
+    """減点理由（1〜2個）。相対的に弱い軸＋リスク・注意点から生成。無ければ限定的と表示。"""
+    m = s.get("metrics", {})
+    ranked = sorted(((a, _disp(s, a)) for a in _POS_ORDER), key=lambda x: x[1])
+    items = []
+    for a, v in ranked:
+        if v > 0.42:
+            continue
+        phrase = _AXIS_NEG[a]
+        if a == "安定性" and m.get("volatility") is not None:
+            phrase += f"（日次ボラ{m['volatility']:.1f}%）"
+        items.append(phrase)
+        if len(items) >= 2:
+            break
+    if len(items) < 2:
+        r = _first_meaningful_risk(s)
+        if r and r not in items:
+            items.append(r)
+    if s.get("macro_caution") and len(items) < 2:
+        items.append(s["macro_caution"])
+    return items[:2] or ["大きな減点要素は限定的"]
 
 
 def _card_tags(s):
@@ -286,11 +347,12 @@ def _bar5(ratio):
 
 
 def _balance_figure(s):
-    """評価バランス図（テキスト）を返す。"""
+    """評価バランス図（テキスト）。相対スコア(display_ratios)で強弱を出す。"""
+    disp = s.get("display_ratios") or {}
     details = s.get("details", {})
-    lines = ["評価バランス"]
+    lines = ["評価バランス（候補内の相対評価）"]
     for k in _BALANCE_ORDER:
-        ratio = (details.get(k, 0) / WEIGHTS[k]) if WEIGHTS.get(k) else 0
+        ratio = disp.get(k, (details.get(k, 0) / WEIGHTS[k]) if WEIGHTS.get(k) else 0)
         lines.append(f"{_BALANCE_LABEL[k]}{_bar5(ratio)}")
     return "\n".join(lines)
 
@@ -368,7 +430,7 @@ def format_screen_stats(stats):
 
 
 def format_stock_section(scored_stocks, macro_context=None):
-    """スクリーニング上位銘柄の詳細（事業内容・タグ・ニュース環境・評価バランス図・評価理由・リスク）。"""
+    """スクリーニング上位銘柄の詳細（今日見る理由・事業・ニュース環境・加点/減点・内訳・リスク）。"""
     lines = [
         "（評価点の目安: 9.0+ 条件多数／8.0+ 複数条件で強い／7.0+ 一部良い／6.0+ 監視候補）",
     ]
@@ -377,15 +439,35 @@ def format_stock_section(scored_stocks, macro_context=None):
         lines.append("")
         lines.append(f"■{rank}位 {s['name']}（{s['code']}） 評価点 {s['score']:.1f}/10（{en}・{ja}）")
         lines.append(f"業種：{s.get('sector') or '—'}")
+        lines.append(f"今日見る理由：{generate_watch_reason(s, macro_context)}")
         lines.append(f"事業：{s.get('business_summary') or '—'}")
         lines.append(f"テーマタグ：{_theme_line(s)}")
+        lines.append(f"ニュース環境との関連：{s.get('news_detail') or s.get('news_line') or '本日は明確なニューステーマは限定的'}")
         lines.append("")
         lines.append(_balance_figure(s))
         lines.append("")
         lines.append(f"スコア内訳：{_breakdown_inline(s.get('details', {}))}")
-        lines.append(f"ニュース環境との関連：{s.get('news_detail') or s.get('news_line') or '本日は明確なニューステーマは限定的'}")
-        lines.append(f"評価理由：{generate_score_reason_text(s)}")
+        lines.append("加点理由：")
+        for r in positive_reasons(s, macro_context):
+            lines.append(f"  ＋ {r}")
+        lines.append("減点理由：")
+        for r in negative_reasons(s):
+            lines.append(f"  － {r}")
         lines.append(f"リスクメモ：{_risk_memo(s)}")
+    return "\n".join(lines)
+
+
+def format_theme_ranking_text(theme_ranking):
+    """今日強いテーマ＋テーマ別スクリーニング上位（詳細テキスト用）。"""
+    if not theme_ranking:
+        return "  テーマ集計は蓄積中です。"
+    lines = ["  今日強いテーマ（スクリーニング上位の集計）："]
+    for i, t in enumerate(theme_ranking[:5], start=1):
+        lines.append(f"   {i}. {t['theme']}（該当{t['count']}銘柄・平均{t['avg_score']:.1f}点）")
+    lines.append("  テーマ別スクリーニング上位（確認銘柄）：")
+    for t in theme_ranking[:5]:
+        names = "、".join(f"{x['name']}（{x['code']}）" for x in t["stocks"][:3])
+        lines.append(f"   ・{t['theme']}：{names or '—'}")
     return "\n".join(lines)
 
 
@@ -429,46 +511,62 @@ def format_theme_view(macro_context):
     return "\n".join(lines)
 
 
-def format_validation_section(validation):
-    if not validation:
-        return "  前回データがないため、検証は次回以降に表示します"
-    v = validation
-    lines = [
-        f"  前回({v['run_date']})上位{v['count']}銘柄の平均騰落率：{_fmt_pct(v['avg_return'])}",
-    ]
-    bench = v.get("benchmark_return")
-    if bench is not None:
-        diff = v["avg_return"] - bench
-        lines.append(f"  市場平均(TOPIX)：{_fmt_pct(bench)}（市場比 {diff:+.2f}pt）")
-    lines.append(f"  結果：{v['wins']}勝{v['losses']}敗")
-    lines.append(f"  最も上昇：{v['best']['name']} {_fmt_pct(v['best']['return'])}")
-    lines.append(f"  最も下落：{v['worst']['name']} {_fmt_pct(v['worst']['return'])}")
+def format_validation_section(validations):
+    """検証結果（前回・3営業日前・1週間前を、データがある範囲で）。"""
+    validations = [v for v in (validations or []) if v]
+    if not validations:
+        return "  検証データは蓄積中です（次回以降に表示します）。"
+    lines = []
+    for v in validations:
+        head = f"  {v['label']}（{v['run_date']}）上位{v['total']}銘柄"
+        if v["evaluated"] < v["total"]:
+            head += f"（取得可能な{v['evaluated']}銘柄のみで検証）"
+        lines.append(head + "：")
+        lines.append(f"    {v['wins']}勝{v['losses']}敗・平均騰落率 {_fmt_pct(v['avg_return'])}")
+        comps = []
+        if v.get("vs_nikkei") is not None:
+            comps.append(f"日経平均比 {v['vs_nikkei']:+.2f}pt")
+        if v.get("vs_topix") is not None:
+            comps.append(f"TOPIX比 {v['vs_topix']:+.2f}pt")
+        if comps:
+            lines.append("    " + "・".join(comps))
+        lines.append(f"    最も上昇：{v['best']['name']} {_fmt_pct(v['best']['return'])}"
+                     f"／最も下落：{v['worst']['name']} {_fmt_pct(v['worst']['return'])}")
     return "\n".join(lines)
 
 
-def _validation_summary(validation):
-    if not validation:
-        return "前回データなし（次回以降に表示）"
-    v = validation
-    bench = ""
-    if v.get("benchmark_return") is not None:
-        diff = v["avg_return"] - v["benchmark_return"]
-        bench = f"（市場比 {diff:+.2f}pt）"
-    return f"平均 {_fmt_pct(v['avg_return'])}{bench}・{v['wins']}勝{v['losses']}敗"
+def _validation_summary_lines(validations):
+    """まとめカード用の前回検証（前回＝直近の1回を短く）。"""
+    validations = [v for v in (validations or []) if v]
+    if not validations:
+        return ["検証データは蓄積中です（次回以降に表示）"]
+    v = validations[0]
+    out = [f"前回上位{v['total']}銘柄：{v['wins']}勝{v['losses']}敗"]
+    out.append(f"平均騰落率：{_fmt_pct(v['avg_return'])}")
+    if v.get("vs_nikkei") is not None:
+        out.append(f"日経平均比：{v['vs_nikkei']:+.2f}pt")
+    elif v.get("vs_topix") is not None:
+        out.append(f"TOPIX比：{v['vs_topix']:+.2f}pt")
+    return out
 
 
-def build_report(market, scored_stocks, stats=None, validation=None, macro_context=None):
+def build_report(market, scored_stocks, stats=None, validations=None,
+                 macro_context=None, theme_ranking=None):
     """詳細レポート全文（ターミナル表示・LINEテキスト用）。"""
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
     parts = [f"【{TITLE}】", SUBTITLE, now, "", DESCRIPTION, ""]
 
-    parts.append("■ 市場概況")
+    parts.append("■ 今日の市場概況")
     parts.append(format_market_section(market))
     parts.append(f"  市場コメント：{market_comment(market, scored_stocks, stats)}")
     parts.append("")
 
     parts.append("■ 今日の世界情勢・経済ニュース")
     parts.append(format_macro_section(macro_context))
+    parts.append("")
+
+    parts.append("■ 今日強いテーマ・テーマ別スクリーニング上位")
+    parts.append(format_theme_ranking_text(theme_ranking))
     parts.append("")
 
     parts.append("■ テーマ別の見方")
@@ -479,15 +577,15 @@ def build_report(market, scored_stocks, stats=None, validation=None, macro_conte
     parts.extend(format_screen_stats(stats))
     parts.append("")
 
-    parts.append(f"■ スクリーニング上位{len(scored_stocks)}銘柄")
+    parts.append(f"■ スクリーニング上位{len(scored_stocks)}銘柄の詳細")
     if scored_stocks:
         parts.append(format_stock_section(scored_stocks, macro_context))
     else:
         parts.append("  条件を満たす銘柄は今回ありませんでした（該当なし）。")
     parts.append("")
 
-    parts.append("■ 前回検証")
-    parts.append(format_validation_section(validation))
+    parts.append("■ 検証結果（過去のスクリーニング上位5銘柄の追跡）")
+    parts.append(format_validation_section(validations))
     parts.append("")
 
     parts.append(DISCLAIMER)
@@ -522,9 +620,9 @@ def _short_business(s, limit=16):
     return b if len(b) <= limit else b[:limit] + "…"
 
 
-def build_flex_message(market, scored_stocks, stats=None, validation=None,
-                       macro_context=None, now_str=None):
-    """LINEの「まとめカード」（集計/市場概況/世界情勢/上位5/前回検証/注意書き）。"""
+def build_flex_message(market, scored_stocks, stats=None, validations=None,
+                       macro_context=None, theme_ranking=None, now_str=None):
+    """LINEの「まとめカード」（集計/市場概況/世界情勢/今日強いテーマ/上位5/検証/注意書き）。"""
     now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
     t = analyze_trend(market, scored_stocks, stats)
 
@@ -582,6 +680,15 @@ def build_flex_message(market, scored_stocks, stats=None, validation=None,
     if mc.get("note"):
         body.append(_flex_text(mc["note"], size="xxs", color="#A9772F", wrap=True, margin="xs"))
 
+    # 今日強いテーマ（スクリーニング集計）
+    if theme_ranking:
+        body.append({"type": "separator", "margin": "md"})
+        body.append(_flex_text("今日強いテーマ（スクリーニング）", size="xs",
+                               color="#888888", margin="md"))
+        body.append(_flex_text(
+            " / ".join(f"{t2['theme']}({t2['count']})" for t2 in theme_ranking[:5]),
+            size="sm", color="#1A3D7C", wrap=True))
+
     body.append({"type": "separator", "margin": "md"})
 
     # スクリーニング上位（簡易ランキング。各銘柄の詳細は後続の横スライドカード）
@@ -604,9 +711,9 @@ def build_flex_message(market, scored_stocks, stats=None, validation=None,
                                size="sm", color="#555555", wrap=True))
 
     body.append({"type": "separator", "margin": "md"})
-    body.append(_flex_text("前回検証", size="xs", color="#888888", margin="md"))
-    body.append(_flex_text(_validation_summary(validation), size="sm",
-                           color="#333333", wrap=True))
+    body.append(_flex_text("検証結果（前回上位5銘柄）", size="xs", color="#888888", margin="md"))
+    for vl in _validation_summary_lines(validations):
+        body.append(_flex_text(vl, size="sm", color="#333333", wrap=True))
 
     footer = {
         "type": "box", "layout": "vertical", "paddingAll": "10px", "contents": [
@@ -672,12 +779,12 @@ def _flex_bar(ratio, accent, track="#E9ECF1", flex=6):
     }
 
 
-def _card_business(s, limit=46):
-    """カード用の事業内容（短縮）。業種から自動生成した場合は簡易分類と明示する。"""
+def _card_business(s, limit=60):
+    """カード用の事業内容（短縮）。固有の事業説明をできるだけ自然に表示する。"""
     b = (s.get("business_summary") or "").strip()
-    if s.get("profile_source") == "auto" or not b:
-        sector = s.get("sector") or "業種不明"
-        return f"{sector}・業種情報をもとにした簡易分類"
+    if not b:
+        sector = s.get("sector") or "—"
+        return f"{sector}領域で事業を展開する企業"
     return b if len(b) <= limit else b[:limit] + "…"
 
 
@@ -711,11 +818,12 @@ def _flex_section_label(text):
 
 
 def _flex_balance_rows(s, accent):
-    """評価バランス図（7軸・ニュース含む）を Flex の横棒グラフ行（ラベル＋バー＋数値）で返す。"""
+    """評価グラフ（7軸）を Flex の横棒グラフ行で返す。相対スコアで強弱を出す。"""
+    disp = s.get("display_ratios") or {}
     details = s.get("details", {})
     rows = []
     for k in _BALANCE_ORDER:
-        ratio = (details.get(k, 0) / WEIGHTS[k]) if WEIGHTS.get(k) else 0
+        ratio = disp.get(k, (details.get(k, 0) / WEIGHTS[k]) if WEIGHTS.get(k) else 0)
         ratio = max(0.0, min(1.0, ratio))
         rows.append({
             "type": "box", "layout": "horizontal", "alignItems": "center",
@@ -734,7 +842,7 @@ def _stock_bubble(rank, s, macro_context=None):
     pal = _card_palette(s["score"])
     en, ja = _rank_label(s["score"])
 
-    # Header: 順位・銘柄名・証券コード/業種・総合評価（大きく）・評価ランク
+    # Header: 順位・銘柄名・証券コード・業種・総合評価（大きく）・評価ランク
     header = {
         "type": "box", "layout": "vertical", "backgroundColor": pal["bg"],
         "paddingAll": "18px", "spacing": "sm", "contents": [
@@ -756,8 +864,17 @@ def _stock_bubble(rank, s, macro_context=None):
         ],
     }
 
-    # Body: 1 事業内容 → 2 ニュース環境 → 3 評価グラフ → 4 評価理由 → 5 リスクメモ
+    # Body: 今日見る理由 → 事業内容 → ニュース環境 → 評価グラフ → 加点理由 → 減点理由 → リスクメモ
     body_contents = [
+        {
+            "type": "box", "layout": "vertical", "backgroundColor": "#EEF3FA",
+            "cornerRadius": "8px", "paddingAll": "12px", "spacing": "xs", "contents": [
+                _flex_text("今日見る理由", size="xxs", color="#3D5A86", weight="bold"),
+                _flex_text(generate_watch_reason(s, macro_context), size="sm",
+                           color="#22344F", wrap=True),
+            ],
+        },
+
         _flex_section_label("事業内容"),
         _flex_text(_card_business(s), size="sm", color="#2D3540", wrap=True, margin="xs"),
         _flex_text("テーマ：" + _theme_line(s), size="xs", color="#7A828C",
@@ -773,11 +890,16 @@ def _stock_bubble(rank, s, macro_context=None):
     body_contents.extend(_flex_balance_rows(s, pal["accent"]))
     body_contents.append({"type": "separator", "margin": "lg"})
 
-    body_contents.append(_flex_section_label("評価理由"))
-    for line in generate_score_reason(s, macro_context):
+    # 加点理由
+    body_contents.append(_flex_section_label("加点理由"))
+    for line in positive_reasons(s, macro_context):
         body_contents.append(
-            _flex_text("・" + line, size="xs", color="#4A5568", wrap=True, margin="xs")
-        )
+            _flex_text("＋ " + line, size="xs", color="#2F6E4E", wrap=True, margin="xs"))
+    # 減点理由
+    body_contents.append(_flex_section_label("減点理由"))
+    for line in negative_reasons(s):
+        body_contents.append(
+            _flex_text("－ " + line, size="xs", color="#9A5A22", wrap=True, margin="xs"))
 
     # リスクメモ（薄い背景の注意ボックス）
     body_contents.append({
