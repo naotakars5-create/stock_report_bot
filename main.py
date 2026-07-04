@@ -105,6 +105,25 @@ def _fetch_valuations(detail_histories):
     return valuations
 
 
+def _attach_calendar(scored_stocks):
+    """
+    最終抽出（上位5）銘柄に、決算予定日・配当権利日を best-effort で付与する。
+
+    カレンダー取得は上位数銘柄だけなので追加のAPI負荷は小さい。取得できない項目は
+    None のまま（カード側で「データ未対応」と明示）。決算の市場予想比などの評価は
+    現状データが無いため取得しない（＝カードでも未対応と表示する）。
+    """
+    for s in scored_stocks:
+        code = (s.get("code") or "").strip()
+        ticker = code if "." in code else f"{code}.T"
+        try:
+            s["calendar"] = data_fetcher.get_calendar_events(ticker)
+        except Exception as e:
+            print(f"[警告] カレンダー取得に失敗（中立扱い）: {s.get('name')} ({code}): {e}")
+            s["calendar"] = {}
+    return scored_stocks
+
+
 def _build_validations(current_prices, nikkei_df, benchmark_df, today_str):
     """過去の上位5銘柄を、前回・3営業日前・1週間前の各回でデータがある範囲で検証する。"""
     runs = report_history.load_runs(before_date=today_str)
@@ -228,6 +247,11 @@ def main():
     else:
         print("[情報] 一次スクリーニングを通過した銘柄はありませんでした。")
     stats["final"] = len(scored_stocks)
+
+    # 4.5 上位銘柄に決算・配当カレンダー（取得可能な日程のみ）を付与
+    if scored_stocks:
+        print("\n■ 上位銘柄の決算・配当カレンダーを取得（取得可能な範囲のみ）")
+        _attach_calendar(scored_stocks)
 
     # 5. 過去レポートの検証（前回・3営業日前・1週間前を、データがある範囲で）
     validations = _build_validations(price_map, nikkei_df, benchmark_df, today_str)

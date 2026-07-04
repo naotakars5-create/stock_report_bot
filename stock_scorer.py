@@ -315,6 +315,16 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
     if not risks:
         risks.append("目立ったリスクシグナルは検出されず")
 
+    # テクニカル節目（サポート/レジスタンス）算出用の直近スイング高値・安値。
+    # これらは「機械的に算出した価格の節目（参考値）」であり、売買推奨ではない。
+    def _win_high(days):
+        w = close.iloc[-days:]
+        return float(w.max()) if len(w) else None
+
+    def _win_low(days):
+        w = close.iloc[-days:]
+        return float(w.min()) if len(w) else None
+
     metrics = {
         "gap_5_25": gap_5_25,
         "gap_25_75": gap_25_75,
@@ -329,6 +339,8 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
         "market_cap": (valuation or {}).get("market_cap"),
         "news_ratio": nr,
         "sma5": sma5, "sma25": sma25, "sma75": sma75,
+        "recent_high_20": _win_high(20), "recent_low_20": _win_low(20),
+        "recent_high_60": _win_high(60), "recent_low_60": _win_low(60),
     }
 
     return {

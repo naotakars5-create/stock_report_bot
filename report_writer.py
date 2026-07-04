@@ -26,6 +26,7 @@ LINE配信は「カード中心」の構成です:
 from datetime import datetime
 
 import macro_analyzer
+import stock_insights as si
 from stock_scorer import WEIGHTS
 
 
@@ -160,7 +161,7 @@ def _risk_memo(s):
 
 def _theme_line(s):
     tags = s.get("theme_tags") or []
-    return " / ".join(tags[:4]) if tags else "—"
+    return " / ".join(tags[:3]) if tags else "—"
 
 
 def _axis_ratio(s, axis):
@@ -768,11 +769,52 @@ def _short_business(s, limit=16):
     return b if len(b) <= limit else b[:limit] + "…"
 
 
+# 相場判定・結論の★ボックス配色（段階が高いほど落ち着いた緑、低いほど暖色寄り）
+def _judgment_palette(n):
+    return {
+        5: {"bg": "#EAF5EF", "fg": "#1C6B4A", "star": "#1C6B4A"},
+        4: {"bg": "#EDF6F1", "fg": "#2F7D5A", "star": "#2F7D5A"},
+        3: {"bg": "#EEF2F8", "fg": "#3A5578", "star": "#3A5578"},
+        2: {"bg": "#FBF4E7", "fg": "#9A6B1E", "star": "#C8912F"},
+        1: {"bg": "#FAEFEB", "fg": "#9A4B33", "star": "#B65C40"},
+    }.get(n, {"bg": "#EEF2F8", "fg": "#3A5578", "star": "#3A5578"})
+
+
+def _flex_star_box(title, stars_str, label, lines):
+    """『今日の相場判定』『今日の結論』用の目立つ★ボックス。lines は説明の箇条書き。"""
+    n = stars_str.count("★")
+    pal = _judgment_palette(n)
+    contents = [
+        _flex_text(title, size="xs", color=pal["fg"], weight="bold"),
+        {"type": "box", "layout": "baseline", "margin": "sm", "contents": [
+            _flex_text(stars_str, size="lg", color=pal["star"], flex=0),
+            _flex_text(label, size="sm", color=pal["fg"], weight="bold", margin="md", wrap=True),
+        ]},
+    ]
+    for ln in lines:
+        contents.append(_flex_text(ln, size="xxs", color="#5A6472", wrap=True, margin="xs"))
+    return {
+        "type": "box", "layout": "vertical", "backgroundColor": pal["bg"],
+        "cornerRadius": "10px", "paddingAll": "14px", "spacing": "xs",
+        "margin": "md", "contents": contents,
+    }
+
+
 def build_flex_message(market, scored_stocks, stats=None, validations=None,
                        macro_context=None, theme_ranking=None, now_str=None):
-    """LINEの「まとめカード」（集計/市場概況/世界情勢/今日強いテーマ/上位5/検証/注意書き）。"""
+    """
+    LINEの「サマリーカード」（トップページ）。1分で全体像がつかめる構成。
+
+    今日の相場判定（★・非投資助言の市場環境判定）→ 集計 → 市場概況 →
+    今日の主要テーマ＋最重要テーマの理由 → 今日強いテーマ → 本日のスクリーニング傾向
+    → 上位5ランキング → 検証結果 → 今日の結論（★）→ 注意書き。
+    """
     now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
     t = analyze_trend(market, scored_stocks, stats)
+    judgment = si.market_judgment(market, stats)
+    conclusion = si.daily_conclusion(scored_stocks, stats, judgment)
+    strategy = si.daily_strategy(scored_stocks, theme_ranking, market, stats)
+    top_theme = si.top_theme_reason(theme_ranking, macro_context)
 
     header = {
         "type": "box", "layout": "vertical", "backgroundColor": "#0B3D91",
@@ -784,8 +826,12 @@ def build_flex_message(market, scored_stocks, stats=None, validations=None,
 
     body = []
 
+    # 【今日の相場判定】（★・非投資助言の市場環境判定。1分で全体像がつかめるよう最上部に）
+    body.append(_flex_star_box("今日の相場判定", judgment["stars"],
+                               judgment["label"], judgment["reasons"]))
+
     # スクリーニング集計（分析対象／取得成功／一次通過／最終抽出）
-    body.append(_flex_text("スクリーニング", size="xs", color="#888888"))
+    body.append(_flex_text("スクリーニング", size="xs", color="#888888", margin="md"))
     for label, key in [("分析対象", "universe"), ("取得成功", "primary_fetched"),
                        ("一次通過", "primary_passed"), ("最終抽出", "final")]:
         body.append({
@@ -814,6 +860,12 @@ def build_flex_message(market, scored_stocks, stats=None, validations=None,
     themes = mc.get("major_themes") or mc.get("summary_themes") or []
     body.append(_flex_text(" / ".join(themes) if themes else "本日は明確なテーマは限定的",
                            size="sm", color="#1A3D7C", weight="bold", wrap=True))
+    # 今日最重要テーマ：順位だけでなく「なぜそのテーマか」を100字以内で
+    if top_theme:
+        body.append(_flex_text(f"◎ 最重要テーマ：{top_theme['theme']}", size="xs",
+                               color="#1A3D7C", weight="bold", margin="sm"))
+        body.append(_flex_text(top_theme["reason"], size="xxs", color="#5A6472",
+                               wrap=True, margin="xs"))
     body.append(_flex_text("マクロ環境：" + (mc.get("market_summary")
                            or "本日の主要テーマは限定的です。"),
                            size="xs", color="#555555", wrap=True, margin="sm"))
@@ -836,6 +888,14 @@ def build_flex_message(market, scored_stocks, stats=None, validations=None,
         body.append(_flex_text(
             " / ".join(f"{t2['theme']}({t2['count']})" for t2 in theme_ranking[:5]),
             size="sm", color="#1A3D7C", wrap=True))
+
+    # 本日のスクリーニング傾向（機械的な観察・売買指示ではない）
+    if strategy:
+        body.append({"type": "separator", "margin": "md"})
+        body.append(_flex_text("本日のスクリーニング傾向", size="xs",
+                               color="#888888", margin="md"))
+        for line in strategy:
+            body.append(_flex_bullet(line))
 
     body.append({"type": "separator", "margin": "md"})
 
@@ -862,6 +922,10 @@ def build_flex_message(market, scored_stocks, stats=None, validations=None,
     body.append(_flex_text("検証結果（前回上位5銘柄）", size="xs", color="#888888", margin="md"))
     for vl in _validation_summary_lines(validations):
         body.append(_flex_text(vl, size="sm", color="#333333", wrap=True))
+
+    # 【今日の結論】（★・非投資助言。スクリーニング環境として一言で締める）
+    body.append(_flex_star_box("今日の結論", conclusion["stars"],
+                               conclusion["label"], [conclusion["reason"]]))
 
     footer = {
         "type": "box", "layout": "vertical", "paddingAll": "10px", "contents": [
@@ -890,12 +954,6 @@ def _card_palette(score):
                 "risk_bg": "#FBF3EB", "risk_fg": "#9A5A22"}
     return {"bg": "#3F454D", "accent": "#6E7884", "sub": "#C5CAD1",   # グレー系
             "risk_bg": "#F1F2F4", "risk_fg": "#6B7077"}
-
-
-def _score_bar10(score):
-    """総合評価(0〜10)を 10ブロックのバーにする。例: 8.6 → █████████░。"""
-    blocks = max(0, min(10, int(round(score))))
-    return "█" * blocks + "░" * (10 - blocks)
 
 
 # 評価ランク（英語表記＋日本語。投資判断に見える語は使わない）
@@ -927,7 +985,7 @@ def _flex_bar(ratio, accent, track="#E9ECF1", flex=6):
     }
 
 
-def _card_business(s, limit=60):
+def _card_business(s, limit=52):
     """カード用の事業内容（短縮）。固有の事業説明をできるだけ自然に表示する。"""
     b = (s.get("business_summary") or "").strip()
     if not b:
@@ -936,19 +994,10 @@ def _card_business(s, limit=60):
     return b if len(b) <= limit else b[:limit] + "…"
 
 
-def _card_news(s):
-    """カード用の「ニュース環境」1行。"""
-    nl = (s.get("news_line") or "").strip()
-    return nl or "本日は明確なニューステーマは限定的"
-
-
-def _card_risk(s, limit=52):
-    """カード用のリスクメモ（最大2件・短縮）。"""
-    risks = s.get("risks") or []
-    if not risks:
-        return "目立ったリスクシグナルは検出されず"
-    txt = "／".join(risks[:2])
-    return txt if len(txt) <= limit else txt[:limit] + "…"
+def _card_news(s, limit=44):
+    """カード用の「ニュース環境」1行（長すぎる場合は短縮）。"""
+    nl = (s.get("news_line") or "").strip() or "本日は明確なニューステーマは限定的"
+    return nl if len(nl) <= limit else nl[:limit] + "…"
 
 
 def _flex_kv(label, value, value_color="#333333"):
@@ -965,6 +1014,27 @@ def _flex_section_label(text):
     return _flex_text(text, size="xs", color="#8A8F98", weight="bold", margin="md")
 
 
+def _flex_icon_head(icon, text, color="#5A6472"):
+    """アイコン付きの小見出し（📊 需給・資金 のような1行・軽量な単一テキスト）。"""
+    return _flex_text(f"{icon} {text}", size="xs", color=color, weight="bold", margin="lg")
+
+
+def _flex_bullet(text, color="#3C4450", dot="・"):
+    """箇条書き1行（先頭に中黒・軽量な単一テキスト）。読みやすさのため wrap 有効。"""
+    return _flex_text(dot + text, size="xs", color=color, wrap=True, margin="xs")
+
+
+def _flex_kv_line(label, value, label_color="#8A8F98", value_color="#2D3540"):
+    """ラベル（左・固定幅）＋値（右・可変）の1行。テクニカル節目などに使用。"""
+    return {
+        "type": "box", "layout": "baseline", "spacing": "sm", "margin": "xs",
+        "contents": [
+            _flex_text(label, size="xs", color=label_color, flex=2),
+            _flex_text(value, size="xs", color=value_color, flex=5, wrap=True),
+        ],
+    }
+
+
 def _flex_balance_rows(s, accent):
     """評価グラフ（7軸）を Flex の横棒グラフ行で返す。相対スコアで強弱を出す。"""
     disp = s.get("display_ratios") or {}
@@ -976,21 +1046,41 @@ def _flex_balance_rows(s, accent):
         rows.append({
             "type": "box", "layout": "horizontal", "alignItems": "center",
             "spacing": "sm", "margin": "sm", "contents": [
-                _flex_text(_CARD_AXIS_LABEL.get(k, k), size="xs", color="#6B7280", flex=3),
+                _flex_text(_CARD_AXIS_LABEL.get(k, k), size="xs", color="#6B7280", flex=2),
                 _flex_bar(ratio, accent, flex=6),
-                _flex_text(f"{ratio * 5:.1f}", size="xs", color="#4A5568",
-                           align="end", flex=2),
             ],
         })
     return rows
 
 
-def _stock_bubble(rank, s, macro_context=None):
-    """1銘柄を1枚の Flex バブル（カード）にする。評価グラフ・評価理由・ニュース環境を必ず掲載。"""
+def _stock_bubble(rank, s, macro_context=None, include_graph=True):
+    """
+    1銘柄を1枚の Flex バブル（カード）にする。銘柄詳細をここに集約し、重複を排除する。
+
+    include_graph=False のときは評価グラフ（相対7軸バー）を省く。カルーセル全体が
+    LINEの50KB上限に近づいた場合に、確実に配信するためのサイズ保護に使う。
+
+    構成（アイコン＋色分け＋箇条書きでスキャンしやすく）:
+      ヘッダー（銘柄名/コード・業種/総合評価＋★/適合ランク）
+      → 事業・テーマ・ニュース（各1行）
+      → 📊 需給・資金（機関投資家視点）
+      → 📅 決算・イベント（取得可能な日程／予想比はデータ未対応）
+      → 📈 テクニカル節目（参考・売買推奨ではない）
+      → 評価グラフ（相対7軸）
+      → ⭐ スクリーニング適合度（＝旧「期待値」を非投資助言で表現）
+      → ⚠️ リスク
+    """
     pal = _card_palette(s["score"])
     en, ja = _rank_label(s["score"])
+    cal = s.get("calendar")
+    inst = si.institutional_view(s)
+    tech = si.technical_levels(s)
+    ev = si.earnings_view(s, cal)
+    events = si.event_view(s, cal)
+    fit = si.expectation_rating(s)
+    star_str = si.stars(si.fit_stars(s["score"]))
 
-    # Header: 順位・銘柄名・証券コード・業種・総合評価（大きく）・評価ランク
+    # Header: 順位・銘柄名・コード・業種・総合評価（大きく＋★）・適合ランク
     header = {
         "type": "box", "layout": "vertical", "backgroundColor": pal["bg"],
         "paddingAll": "18px", "spacing": "sm", "contents": [
@@ -1002,65 +1092,70 @@ def _stock_bubble(rank, s, macro_context=None):
             {"type": "box", "layout": "baseline", "margin": "lg", "contents": [
                 _flex_text(f"{s['score']:.1f}", color="#FFFFFF", size="3xl", weight="bold"),
                 _flex_text("/ 10", color=pal["sub"], size="sm", margin="md"),
+                _flex_text(star_str, color="#FFD479", size="sm", align="end"),
             ]},
-            _flex_text("SCREENING SCORE", color=pal["sub"], size="xxs"),
-            _flex_text(_score_bar10(s["score"]), color="#FFFFFF", size="sm", margin="sm"),
             {"type": "box", "layout": "baseline", "margin": "sm", "contents": [
-                _flex_text(en, color="#FFFFFF", size="sm", weight="bold"),
-                _flex_text("・" + ja, color=pal["sub"], size="xs", margin="sm"),
+                _flex_text("SCREENING SCORE", color=pal["sub"], size="xxs", flex=0),
+                _flex_text(f"{en}・{ja}", color="#FFFFFF", size="xs", align="end", wrap=True),
             ]},
         ],
     }
 
-    # Body: 今日見る理由 → 事業内容 → ニュース環境 → 評価グラフ → 加点理由 → 減点理由 → リスクメモ
-    body_contents = [
-        {
-            "type": "box", "layout": "vertical", "backgroundColor": "#EEF3FA",
-            "cornerRadius": "8px", "paddingAll": "12px", "spacing": "xs", "contents": [
-                _flex_text("今日見る理由", size="xxs", color="#3D5A86", weight="bold"),
-                _flex_text(generate_watch_reason(s, macro_context), size="sm",
-                           color="#22344F", wrap=True),
-            ],
-        },
+    body_contents = []
 
-        _flex_section_label("事業内容"),
-        _flex_text(_card_business(s), size="sm", color="#2D3540", wrap=True, margin="xs"),
-        _flex_text("テーマ：" + _theme_line(s), size="xs", color="#7A828C",
-                   wrap=True, margin="sm"),
-        {"type": "separator", "margin": "lg"},
+    # 事業・テーマ・ニュース（重複を避け、各1行に集約）
+    body_contents.append(_flex_text(_card_business(s), size="sm", color="#2D3540", wrap=True))
+    body_contents.append(_flex_kv_line("テーマ", _theme_line(s)))
+    body_contents.append(_flex_kv_line("ニュース", _card_news(s)))
 
-        _flex_section_label("ニュース環境"),
-        _flex_text(_card_news(s), size="sm", color="#2D3540", wrap=True, margin="xs"),
-        {"type": "separator", "margin": "lg"},
+    # 📊 需給・資金（機関投資家視点・機械的推定）
+    body_contents.append(_flex_icon_head("📊", "需給・資金（機械的推定）"))
+    body_contents.append(_flex_bullet(inst["volume"]))
+    body_contents.append(_flex_bullet(inst["money"]))
+    body_contents.append(_flex_bullet(inst["supply"]))
 
-        _flex_section_label("評価グラフ"),
-    ]
-    body_contents.extend(_flex_balance_rows(s, pal["accent"]))
-    body_contents.append({"type": "separator", "margin": "lg"})
+    # 📅 決算・イベント（取得可能な日程のみ）
+    body_contents.append(_flex_icon_head("📅", "決算・イベント"))
+    body_contents.append(_flex_bullet(ev["date_line"]))
+    body_contents.append(_flex_bullet(ev["beat_line"], color="#8A8F98"))
+    for it in events["items"]:
+        body_contents.append(_flex_bullet(it, color=("#3C4450" if events["has_event"] else "#8A8F98")))
 
-    # 加点理由
-    body_contents.append(_flex_section_label("加点理由"))
-    for line in positive_reasons(s, macro_context):
-        body_contents.append(
-            _flex_text("＋ " + line, size="xs", color="#2F6E4E", wrap=True, margin="xs"))
-    # 減点理由
-    body_contents.append(_flex_section_label("減点理由"))
-    for line in negative_reasons(s):
-        body_contents.append(
-            _flex_text("－ " + line, size="xs", color="#9A5A22", wrap=True, margin="xs"))
+    # 📈 テクニカル節目（参考・売買推奨ではない）
+    body_contents.append(_flex_icon_head("📈", "テクニカル節目（参考）"))
+    body_contents.append(_flex_kv_line("下値メド", tech["support"]))
+    body_contents.append(_flex_kv_line("上値メド", tech["resistance"]))
+    body_contents.append(_flex_text(f"直近レンジ {tech['range']}／{tech['note']}",
+                                    size="xxs", color="#AEB4BC", wrap=True, margin="xs"))
 
-    # リスクメモ（薄い背景の注意ボックス）
+    # 評価グラフ（相対7軸）※サイズ保護時は省略
+    if include_graph:
+        body_contents.append(_flex_icon_head("📐", "評価グラフ（候補内の相対評価）"))
+        body_contents.extend(_flex_balance_rows(s, pal["accent"]))
+
+    # ⭐ スクリーニング適合度（＝旧「期待値」を非投資助言で表現）
+    body_contents.append(_flex_icon_head("⭐", "スクリーニング適合度"))
     body_contents.append({
-        "type": "box", "layout": "vertical", "backgroundColor": pal["risk_bg"],
-        "cornerRadius": "8px", "paddingAll": "12px", "margin": "lg", "spacing": "xs",
-        "contents": [
-            _flex_text("リスクメモ", size="xxs", color=pal["risk_fg"], weight="bold"),
-            _flex_text(_card_risk(s), size="xs", color=pal["risk_fg"], wrap=True),
+        "type": "box", "layout": "baseline", "margin": "xs", "contents": [
+            _flex_text(fit["stars"], color="#E8A93B", size="md", flex=0),
+            _flex_text(fit["label"], size="xs", color="#3C4450", margin="sm"),
         ],
     })
+    body_contents.append(_flex_text("理由：" + fit["reason"], size="xxs",
+                                    color="#7A828C", wrap=True, margin="xs"))
+
+    # ⚠️ リスク（薄い背景の注意ボックス）
+    risk_box = {
+        "type": "box", "layout": "vertical", "backgroundColor": pal["risk_bg"],
+        "cornerRadius": "8px", "paddingAll": "12px", "margin": "lg", "spacing": "xs",
+        "contents": [_flex_text("⚠️ リスク", size="xxs", color=pal["risk_fg"], weight="bold")],
+    }
+    for r in si.risk_flags(s, cal)[:3]:
+        risk_box["contents"].append(_flex_bullet(r, color=pal["risk_fg"]))
+    body_contents.append(risk_box)
 
     body = {"type": "box", "layout": "vertical", "paddingAll": "18px",
-            "spacing": "md", "contents": body_contents}
+            "spacing": "sm", "contents": body_contents}
 
     footer = {
         "type": "box", "layout": "vertical", "paddingAll": "12px", "spacing": "xs",
@@ -1079,9 +1174,11 @@ def build_stock_cards(scored_stocks, macro_context=None, now_str=None):
     """
     スクリーニング上位銘柄を横スライドできる Flex カルーセルにする。
 
-    1銘柄＝1カード（最大5枚）。各カードに 順位／銘柄名／コード／業種／事業内容／
-    テーマタグ／ニュース環境／総合評価・評価ランク／評価バランス図（7軸）／
-    評価理由／リスクメモ／注意書きを掲載する。
+    1銘柄＝1カード（最大5枚）。各カードに 銘柄名／コード／業種／総合評価＋★／
+    適合ランク／事業・テーマ・ニュース（各1行）／📊需給・資金（機械的推定）／
+    📅決算・イベント（取得可能な日程・予想比は未対応と明示）／📈テクニカル節目
+    （参考）／評価グラフ（相対7軸）／⭐スクリーニング適合度／⚠️リスク／注意書き
+    を、アイコン・色分け・箇条書きで重複なく集約する。
     戻り値: (alt_text, carousel_contents)。銘柄が無ければ None。
     """
     if not scored_stocks:
@@ -1089,5 +1186,15 @@ def build_stock_cards(scored_stocks, macro_context=None, now_str=None):
     now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
     bubbles = [_stock_bubble(i, s, macro_context) for i, s in enumerate(scored_stocks, start=1)]
     carousel = {"type": "carousel", "contents": bubbles}
+
+    # サイズ保護: LINE Flex は 1メッセージ 50KB 上限。長い銘柄名等で近づいた場合は、
+    # 最も重い評価グラフを外して確実に配信する（グラフはサマリーカードでも代替可能）。
+    import json
+    if len(json.dumps(carousel, ensure_ascii=False).encode("utf-8")) > 49000:
+        print("[カード] カルーセルが50KBに近いため、評価グラフを省いて軽量化します。")
+        bubbles = [_stock_bubble(i, s, macro_context, include_graph=False)
+                   for i, s in enumerate(scored_stocks, start=1)]
+        carousel = {"type": "carousel", "contents": bubbles}
+
     alt = f"スクリーニング上位{len(bubbles)}銘柄カード（{now_str}）"
     return alt, carousel
