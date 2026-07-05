@@ -326,6 +326,30 @@ def main(dry_run=False):
     #    銘柄ごとの詳細はカードに集約し、補足テキストでは繰り返さない。
     #    長文レポート(build_report)はターミナル確認・将来のWeb/PDF用で、LINEには送らない。
     basis_label = _basis_label(basis_date)
+
+    # P1-2: 前回上位銘柄の「スコア・加点/リスク」と実際の結果を接続した自己言及文。
+    pick_results = report_history.build_pick_results(previous, price_map)
+    self_ref_lines = report_writer.self_ref_sentences(pick_results)
+    # 今回の上位銘柄に、次回の自己言及文用の主因・リスクを付与（履歴に保存する）。
+    for s in scored_stocks:
+        pr = report_writer.positive_reasons(s, macro_context)
+        nr = report_writer.negative_reasons(s)
+        s["top_reason"] = pr[0] if pr else ""
+        s["top_risk"] = nr[0] if nr else ""
+
+    # P1-3: 通過率のパーセンタイル文脈（過去30営業日が貯まってから表示）。
+    pass_rate = (stats["primary_passed"] / stats["universe"] * 100
+                 if stats.get("universe") else None)
+    hist_rows = report_history.load_daily_stats(before_date=today_str)
+    pass_hist = []
+    for r in hist_rows:
+        try:
+            pass_hist.append(float(r.get("pass_rate")))
+        except (TypeError, ValueError):
+            pass
+    pctl = report_history.percentile_context(pass_rate, pass_hist, kind="low")
+    pass_rate_ctx = f"通過率は{pctl}" if pctl else None
+
     report = report_writer.build_report(
         market, scored_stocks, stats, validations=validations,
         macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
@@ -338,7 +362,9 @@ def main(dry_run=False):
     flex_messages = [
         report_writer.build_flex_message(
             market, scored_stocks, stats, validations=validations,
-            macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
+            macro_context=macro_context, theme_ranking=theme_ranking,
+            basis_label=basis_label, pass_rate_ctx=pass_rate_ctx,
+            self_ref_lines=self_ref_lines)
     ]
     cards = report_writer.build_stock_cards(scored_stocks, macro_context=macro_context)
     if cards:
@@ -354,6 +380,11 @@ def main(dry_run=False):
         report_history.save_report(scored_stocks)
     elif dry_run:
         print("[DRY-RUN] 履歴CSVへの保存はスキップしました。")
+
+    # 7.5 日次集計（通過率・前回検証成績）を保存（P1-3 パーセンタイル用の蓄積）。
+    if not dry_run:
+        report_history.save_daily_stat(
+            today_str, pass_rate, validations[0] if validations else None)
 
     return 0
 

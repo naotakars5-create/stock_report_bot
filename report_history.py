@@ -24,7 +24,10 @@ from datetime import datetime, date
 
 
 DEFAULT_PATH = os.path.join("data", "report_history.csv")
-FIELDS = ["run_date", "code", "name", "rank", "score", "price", "sector", "theme_tags"]
+# top_reason/top_risk は「検証の自己言及文」(P1-2)用に、その日の主な加点理由・
+# リスクメモを保存する。古いCSV（列が無い形式）でも DictReader で自動移行できる。
+FIELDS = ["run_date", "code", "name", "rank", "score", "price", "sector",
+          "theme_tags", "top_reason", "top_risk"]
 
 
 def _read_rows(path):
@@ -75,6 +78,8 @@ def save_report(scored_stocks, path=DEFAULT_PATH, run_date=None):
                 "price": f"{s.get('price', 0):.1f}",
                 "sector": s.get("sector", ""),
                 "theme_tags": _join_tags(s.get("theme_tags")),
+                "top_reason": (s.get("top_reason") or "").strip(),
+                "top_risk": (s.get("top_risk") or "").strip(),
             })
 
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
@@ -240,3 +245,137 @@ def build_validation(run, current_prices, nikkei_pct=None, topix_pct=None, label
         "vs_nikkei": (avg - nikkei_pct) if nikkei_pct is not None else None,
         "vs_topix": (avg - topix_pct) if topix_pct is not None else None,
     }
+
+
+def build_pick_results(run, current_prices):
+    """
+    【P1-2】ある回の上位5銘柄について、スコア・加点理由・リスクと騰落率を突合する。
+
+    戻り値: [{name, score, return, top_reason, top_risk}, ...]（騰落率の降順）。
+    保存済みの top_reason / top_risk（その日の主因・リスク）を持ち出すことで、
+    「昨日X点の〇〇は+Y%。加点理由だった□□が継続」といった自己言及文を作れる。
+    """
+    if not run or not run.get("entries"):
+        return []
+    out = []
+    for e in run["entries"][:5]:
+        code = (e.get("code") or "").strip()
+        try:
+            prev_price = float(e.get("price"))
+        except (TypeError, ValueError):
+            continue
+        cur = current_prices.get(code)
+        if cur is None or prev_price <= 0:
+            continue
+        out.append({
+            "name": (e.get("name") or "").strip(),
+            "score": (e.get("score") or "").strip(),
+            "return": (cur - prev_price) / prev_price * 100,
+            "top_reason": (e.get("top_reason") or "").strip(),
+            "top_risk": (e.get("top_risk") or "").strip(),
+        })
+    out.sort(key=lambda x: x["return"], reverse=True)
+    return out
+
+
+# ====== 日次集計（P1-3: 通過率・成績のパーセンタイル表示用） ======
+STATS_PATH = os.path.join("data", "daily_stats.csv")
+STATS_FIELDS = ["stat_date", "pass_rate", "avg_change_pct", "vs_nikkei_pt",
+                "win_count", "lose_count"]
+
+
+def save_daily_stat(stat_date, pass_rate, validation=None, path=STATS_PATH):
+    """
+    その日の集計値（通過率、および前回検証の成績）を daily_stats.csv に保存する。
+
+    同じ stat_date の既存行は置き換える。失敗しても全体は止めない。
+    validation は build_validation の戻り（前回上位5の成績）。無ければ成績列は空。
+    """
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        rows = [r for r in _read_stats(path)
+                if (r.get("stat_date") or "").strip() != stat_date]
+        v = validation or {}
+        rows.append({
+            "stat_date": stat_date,
+            "pass_rate": f"{pass_rate:.2f}" if pass_rate is not None else "",
+            "avg_change_pct": f"{v.get('avg_return'):.2f}" if v.get("avg_return") is not None else "",
+            "vs_nikkei_pt": f"{v.get('vs_nikkei'):.2f}" if v.get("vs_nikkei") is not None else "",
+            "win_count": v.get("wins", ""),
+            "lose_count": v.get("losses", ""),
+        })
+        rows.sort(key=lambda r: (r.get("stat_date") or ""))
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=STATS_FIELDS)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k, "") for k in STATS_FIELDS})
+        return True
+    except Exception as e:
+        print(f"[警告] 日次集計の保存に失敗しました: {e}")
+        return False
+
+
+def _read_stats(path=STATS_PATH):
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f))
+    except Exception:
+        return []
+
+
+def load_daily_stats(path=STATS_PATH, before_date=None):
+    """daily_stats を stat_date 昇順で返す（before_date 指定時はそれより前）。"""
+    rows = _read_stats(path)
+    out = []
+    for r in rows:
+        d = (r.get("stat_date") or "").strip()
+        if not d or (before_date and d >= before_date):
+            continue
+        out.append(r)
+    out.sort(key=lambda r: r.get("stat_date") or "")
+    return out
+
+
+def _floats(rows, key):
+    vals = []
+    for r in rows:
+        try:
+            vals.append(float(r.get(key)))
+        except (TypeError, ValueError):
+            continue
+    return vals
+
+
+def percentile_context(today_value, history_values, kind="low", window=30, min_n=30):
+    """
+    today_value が history_values（過去の系列）の中でどの位置かを説明する文言を返す。
+
+    kind="low": 小さいほど目立つ（通過率＝絞られた水準）。
+    kind="high": 大きいほど目立つ（成績＝良い水準）。
+    データが min_n 未満なら None（表示しない）。window 件で評価する。
+    """
+    if today_value is None:
+        return None
+    hist = [v for v in (history_values or [])][-window:]
+    if len(hist) < min_n:
+        return None
+    n = len(hist)
+    if kind == "low":
+        rank = sum(1 for v in hist if v < today_value) + 1  # 小さい順の順位
+        if rank == 1:
+            return f"過去{n}営業日で最も絞られた水準"
+        if rank <= 3:
+            return f"過去{n}営業日で低い方から{rank}番目"
+        return None
+    else:
+        rank = sum(1 for v in hist if v > today_value) + 1  # 大きい順の順位
+        if rank == 1:
+            return f"過去{n}営業日で最も高い水準"
+        if rank <= 3:
+            return f"過去{n}営業日で高い方から{rank}番目"
+        return None

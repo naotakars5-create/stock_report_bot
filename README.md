@@ -437,7 +437,7 @@ $env:MAX_STOCKS = "all"; python main.py   # none / 0 でも全銘柄
 | `profile_loader.py` | 事業内容・テーマタグの提供（CSV優先、無ければ業種から自動生成） |
 | `company_profiles.csv` | 企業の事業内容・テーマタグの登録ファイル（手入力で追記可） |
 | `report_writer.py` | レポート/LINE Flexカードの整形（相場判定・銘柄カード各セクション・補足テキスト） |
-| `report_history.py` | 上位5銘柄の保存（同日重複排除）と、前回・3営業日前・1週間前の検証集計 |
+| `report_history.py` | 上位5銘柄の保存（同日重複排除・主因/リスクも保存）／検証集計／自己言及文用の突合／日次集計(`data/daily_stats.csv`)の保存とパーセンタイル判定 |
 | `line_sender.py` | LINE Messaging API への Push 送信（分割送信・失敗時も継続） |
 | `get_line_user_id.py` | （補助）`LINE_USER_ID` 取得用の簡易Webhookサーバー。本番では未使用 |
 | `jpx_listed_companies.csv` | 上場銘柄一覧（code, name, market, sector）。起動時にJPXから自動更新 |

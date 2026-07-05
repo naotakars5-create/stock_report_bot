@@ -50,20 +50,21 @@ jobs:
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
         run: python main.py
 
-      - name: 前回検証用の履歴を保存（コミット）
-        # スクリーニング結果の履歴(data/report_history.csv)をリポジトリへ
-        # 反映し、次回実行時の「前回レポートの検証」に使えるようにする。
+      - name: 前回検証用の履歴・日次集計を保存（コミット）
+        # スクリーニング結果の履歴(data/report_history.csv)と日次集計
+        # (data/daily_stats.csv)をリポジトリへ反映し、次回実行時の「前回レポートの
+        # 検証」「通過率のパーセンタイル表示(P1-3)」に使えるようにする。
         run: |
-          if [ ! -f data/report_history.csv ]; then
-            echo "履歴ファイルが無いためスキップします。"
+          if [ ! -d data ]; then
+            echo "data ディレクトリが無いためスキップします。"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/report_history.csv
+          git add data/
           if git diff --staged --quiet; then
-            echo "履歴に変更はありません。"
+            echo "履歴・集計に変更はありません。"
           else
-            git commit -m "Update report history [skip ci]"
+            git commit -m "Update report history and daily stats [skip ci]"
             git push
           fi

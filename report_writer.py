@@ -23,6 +23,7 @@ LINE配信は「カード中心」の構成です:
   - analyze_trend()        : 市場全体トレンドの機械的サマリー
 """
 
+import re
 from datetime import datetime
 
 import macro_analyzer
@@ -543,6 +544,35 @@ def format_validation_section(validations):
         lines.append(f"    最も上昇：{v['best']['name']} {_fmt_pct(v['best']['return'])}"
                      f"／最も下落：{v['worst']['name']} {_fmt_pct(v['worst']['return'])}")
     return "\n".join(lines)
+
+
+def _trim_reason(text, limit=24):
+    """自己言及文用に、加点理由/リスクの括弧注記を落として短くする。"""
+    t = re.sub(r"（[^）]*）", "", text or "").strip()
+    return t if len(t) <= limit else t[:limit] + "…"
+
+
+def self_ref_sentences(pick_results):
+    """
+    【P1-2】前回上位銘柄の「スコア・加点/リスク」と実際の結果を接続した自己言及文。
+
+    例: 「昨日9.2点の中部電力は+1.8%。加点理由だった出来高増が継続」
+        「昨日8.0点のセレスは-2.1%。リスクメモで指摘した高値圏の上値抵抗が顕在化」
+    テンプレート＋条件分岐で生成（LLM不使用）。最大2文。データが無ければ空。
+    """
+    if not pick_results:
+        return []
+    lines = []
+    best = pick_results[0]
+    if best["return"] > 0.05 and best["top_reason"]:
+        lines.append(f"昨日{best['score']}点の{best['name']}は{best['return']:+.1f}%。"
+                     f"加点理由だった{_trim_reason(best['top_reason'])}が継続。")
+    worst = pick_results[-1]
+    if (worst["return"] < -0.05 and worst["top_risk"]
+            and worst["name"] != best["name"]):
+        lines.append(f"昨日{worst['score']}点の{worst['name']}は{worst['return']:+.1f}%。"
+                     f"リスクメモで指摘した{_trim_reason(worst['top_risk'])}が顕在化。")
+    return lines[:2]
 
 
 def _validation_summary_lines(validations):
