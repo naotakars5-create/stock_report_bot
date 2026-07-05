@@ -129,16 +129,18 @@ def technical_levels(s):
     else:
         support = f"{_fmt_price(low60 or low20)}（直近安値）"
 
-    # 上値メド: 価格より上の節目のうち最も近いもの
+    # 上値メド: 価格より上の節目のうち最も近いもの。無ければ None（＝行ごと非表示）。
     above = [("直近20日高値", high20), ("直近60日高値", high60)]
     above = [(lbl, v) for lbl, v in above if v is not None and v > price]
     if above:
         lbl, v = min(above, key=lambda x: x[1])
         resistance = f"{_fmt_price(v)}（{lbl}）"
     else:
-        resistance = "直近高値を更新中（明確な上値メドは限定的）"
+        resistance = None  # 直近高値を更新中 → 上値メドは非表示
 
-    rng = f"{_fmt_price(low20)}〜{_fmt_price(high20)}（直近20日）"
+    rng = None
+    if low20 is not None and high20 is not None:
+        rng = f"{_fmt_price(low20)}〜{_fmt_price(high20)}（直近20日）"
     note = "機械的に算出した価格の節目です（参考・売買推奨ではありません）"
     return {"support": support, "resistance": resistance, "range": rng, "note": note}
 
@@ -161,16 +163,18 @@ def earnings_view(s, calendar=None, today=None):
     ed = cal.get("earnings_date")
     du = _days_until(ed, today)
     soon = du is not None and 0 <= du <= 14
+    # 決算日が取得できない場合は date_line=None（カードでは行ごと非表示）。
+    # 市場予想比（売上/利益/ガイダンス）はデータ源が無いため、ここでは扱わない
+    # （＝「データ未対応」の行はカードに出さず、非表示にする方針）。
     if ed is None:
-        date_line = "次回決算日はデータ範囲では未取得"
+        date_line = None
     elif du is not None and du < 0:
         date_line = f"直近決算 {ed:%m/%d}（発表済み）"
     elif soon:
         date_line = f"次回決算 {ed:%m/%d}（あと{du}日・決算跨ぎに注意）"
     else:
         date_line = f"次回決算 {ed:%m/%d} 予定"
-    beat_line = "市場予想比（売上/利益/ガイダンス）はデータ未対応"
-    return {"date_line": date_line, "beat_line": beat_line, "soon": soon}
+    return {"date_line": date_line, "soon": soon}
 
 
 def event_view(s, calendar=None, today=None, horizon_days=14):
@@ -191,8 +195,7 @@ def event_view(s, calendar=None, today=None, horizon_days=14):
         items.append(f"{xd:%m/%d} 配当権利落ち（あと{dx}日）")
     if items:
         return {"items": items, "has_event": True}
-    return {"items": ["直近1〜2週間は配当権利日等なし（総会・指数組入・展示会等はデータ未対応）"],
-            "has_event": False}
+    return {"items": ["直近1〜2週間の決算・配当イベントなし"], "has_event": False}
 
 
 # ====== ④ スクリーニング適合度（＝旧「期待値」を非投資助言で言い換え） ======
@@ -344,50 +347,6 @@ def market_judgment(market, stats=None):
     return {"stars_n": n, "stars": stars(n), "label": label, "reasons": reasons}
 
 
-def daily_strategy(scored_stocks, theme_ranking=None, market=None, stats=None):
-    """
-    本日のスクリーニング傾向（機械的な観察）。売買の指示ではなく、
-    上位銘柄の分布・テーマ集中・過熱度などの事実を箇条書きで示す。
-    """
-    bullets = []
-    scored = scored_stocks or []
-
-    # 規模の分布
-    sizes = [s.get("size_category") for s in scored]
-    big = sizes.count("大型")
-    small = sizes.count("小型")
-    if scored:
-        if big >= 3:
-            bullets.append("上位は大型株が中心（値動きは相対的に落ち着きやすい）")
-        elif small >= 3:
-            bullets.append("上位は小型株が中心（値動きは荒くなりやすい）")
-        else:
-            bullets.append("上位は大型〜小型が混在")
-
-    # テーマ集中
-    if theme_ranking:
-        top = theme_ranking[0]
-        if top.get("count", 0) >= 3:
-            bullets.append(f"テーマは「{top['theme']}」に集中（該当{top['count']}銘柄）")
-        else:
-            bullets.append("テーマは分散（特定テーマへの集中は限定的）")
-
-    # 過熱度
-    hot = sum(1 for s in scored if (_m(s, "surge_5") or 0) >= 12)
-    if hot >= 2:
-        bullets.append("短期過熱ぎみの銘柄が複数あり、値動きは荒くなりやすい")
-
-    # 物色の裾野
-    stats = stats or {}
-    uni, passed = stats.get("universe", 0), stats.get("primary_passed", 0)
-    if uni:
-        ratio = passed / uni * 100
-        level = "多い" if ratio >= 5 else ("平常" if ratio >= 2 else "少ない")
-        bullets.append(f"条件該当は{passed}銘柄と{level}")
-
-    return bullets[:4] or ["本日のスクリーニング傾向は中立的です"]
-
-
 def top_theme_reason(theme_ranking, macro_context=None):
     """
     今日最重要テーマと「なぜそのテーマなのか」を100文字以内で説明する。
@@ -409,44 +368,71 @@ def top_theme_reason(theme_ranking, macro_context=None):
     return {"theme": theme, "reason": reason[:100]}
 
 
-def daily_conclusion(scored_stocks, stats=None, judgment=None):
+def daily_temperature(scored_stocks, market=None, stats=None, judgment=None):
     """
-    今日の結論（1行・5段階）。「積極的/様子見」ではなく、スクリーニング環境として
-    「確認の価値がどの程度あるか」を機械的に示す（非投資助言）。
+    【P1-1】本日の温度感（積極 / 中立 / 慎重 の3段階）＋理由1行。
 
-    戻り値: {"stars_n", "stars", "label", "reason"}
+    その日のスクリーニング環境の「温度感」を機械的に1行で示す（売買推奨ではない）。
+    判定ロジック（コード＝README両方に明記）:
+      base = 相場判定の段階(1〜5) を中心化: (stars_n - 3) → -2〜+2
+      + 通過率(物色の裾野):  ≥5% → +1 / 2〜5% → 0 / <2% → -1
+      + 上位の時価総額分布:  小型が3銘柄以上 → -1（値動きが荒くなりやすい）
+                              大型が3銘柄以上 → +0.5（相対的に落ち着きやすい）
+      + 過熱:                直近5日+12%超が2銘柄以上 → -0.5
+      合計 raw を  ≥1.5→積極 / ≤-1.0→慎重 / それ以外→中立 にマッピング。
+    理由は最も効いた要因を1文で述べる。
+
+    戻り値: {"level": "積極"/"中立"/"慎重", "reason": str, "tone": "positive"/"neutral"/"caution"}
     """
+    judgment = judgment or market_judgment(market, stats)
     scored = scored_stocks or []
     stats = stats or {}
     uni, passed = stats.get("universe", 0), stats.get("primary_passed", 0)
     breadth = (passed / uni * 100) if uni else None
-    avg = (sum(s.get("score", 0) for s in scored) / len(scored)) if scored else 0
-    jn = (judgment or {}).get("stars_n", 3)
+    small = sum(1 for s in scored if s.get("size_category") == "小型")
+    big = sum(1 for s in scored if s.get("size_category") == "大型")
+    hot = sum(1 for s in scored if (_m(s, "surge_5") or 0) >= 12)
+    jn = judgment.get("stars_n", 3)
 
-    raw = 0
-    if avg >= 8.0:
-        raw += 2
-    elif avg >= 7.0:
-        raw += 1
+    raw = (jn - 3)
     if breadth is not None:
         raw += 1 if breadth >= 5 else (0 if breadth >= 2 else -1)
-    raw += (jn - 3) * 0.5
+    if scored and small >= 3:
+        raw -= 1
+    elif scored and big >= 3:
+        raw += 0.5
+    if hot >= 2:
+        raw -= 0.5
 
-    if raw >= 2.5:
-        n, label = 5, "条件該当が多く材料が揃う日"
-    elif raw >= 1.0:
-        n, label = 4, "複数の条件該当があり確認の価値あり"
-    elif raw >= -0.5:
-        n, label = 3, "平常運転（目立った偏りは限定的）"
-    elif raw >= -1.5:
-        n, label = 2, "該当は限定的"
+    if raw >= 1.5:
+        level, tone = "積極", "positive"
+    elif raw <= -1.0:
+        level, tone = "慎重", "caution"
     else:
-        n, label = 1, "該当が乏しい日"
+        level, tone = "中立", "neutral"
 
-    if scored:
-        reason = f"上位{len(scored)}銘柄の平均適合スコア{avg:.1f}／10。"
+    # 理由: 判定(level)と整合する主因を1文で（積極なら支え要因、慎重なら警戒要因）。
+    if tone == "caution":
+        if scored and small >= 3:
+            reason = "上位が小型株に偏り、値動きが荒くなりやすい"
+        elif hot >= 2:
+            reason = "短期過熱ぎみの銘柄が多く、値動きが荒くなりやすい"
+        elif breadth is not None and breadth < 2:
+            reason = f"通過が{passed}銘柄と絞られ、物色は限定的"
+        else:
+            reason = "地合いが慎重で、上値の重い展開"
+    elif tone == "positive":
+        if jn >= 4 and (breadth is None or breadth >= 5):
+            reason = "地合いが支えられ、条件該当の裾野も広い"
+        elif scored and big >= 3:
+            reason = "上位は大型株中心で相対的に落ち着きやすい"
+        else:
+            reason = "地合い・物色とも条件がそろいやすい"
     else:
-        reason = "本日は条件を満たす銘柄がありませんでした。"
-    if breadth is not None:
-        reason += f"通過は全体の{breadth:.1f}%。"
-    return {"stars_n": n, "stars": stars(n), "label": label, "reason": reason}
+        if scored and small >= 3:
+            reason = "地合いは中立だが、上位に小型株が多く値動きは荒くなりやすい"
+        elif breadth is not None and breadth < 2:
+            reason = "物色はやや限定的で、方向感は乏しい"
+        else:
+            reason = "地合い・物色とも目立った偏りは限定的"
+    return {"level": level, "reason": reason, "tone": tone}
