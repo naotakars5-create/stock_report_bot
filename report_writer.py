@@ -645,7 +645,8 @@ def _followup_sections(market, scored_stocks, stats, validations,
 
 
 def build_followup_text(market, scored_stocks, stats=None, validations=None,
-                        macro_context=None, theme_ranking=None, now_str=None):
+                        macro_context=None, theme_ranking=None, now_str=None,
+                        basis_label=None):
     """
     カードの後に送る「短い補足テキスト」（最大1500字・目安1000字以内）。
 
@@ -654,7 +655,8 @@ def build_followup_text(market, scored_stocks, stats=None, validations=None,
     含めるのは: 今日のニュース・マクロ環境／今日強いテーマ／テーマ別確認銘柄／検証結果。
     """
     now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
-    parts = ["【補足レポート】", f"{SUBTITLE} ・ {now_str}", ""]
+    head2 = basis_label or f"{SUBTITLE} ・ {now_str}"
+    parts = ["【補足レポート】", head2, ""]
     parts.extend(_followup_sections(
         market, scored_stocks, stats, validations, macro_context, theme_ranking))
     parts.append("")
@@ -664,7 +666,8 @@ def build_followup_text(market, scored_stocks, stats=None, validations=None,
 
 
 def build_fallback_text(market, scored_stocks, stats=None, validations=None,
-                        macro_context=None, theme_ranking=None, now_str=None):
+                        macro_context=None, theme_ranking=None, now_str=None,
+                        basis_label=None):
     """
     Flexカードの送信に失敗したときだけ使う短縮テキスト。
 
@@ -672,8 +675,8 @@ def build_fallback_text(market, scored_stocks, stats=None, validations=None,
     続けて補足テキスト本文を載せる。長文にはせず、最大1500字に収める。
     """
     now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
-    parts = [f"【{TITLE}】（カード表示の代替・短縮版）",
-             f"{SUBTITLE} ・ {now_str}", ""]
+    head2 = basis_label or f"{SUBTITLE} ・ {now_str}"
+    parts = [f"【{TITLE}】（カード表示の代替・短縮版）", head2, ""]
     parts.append(f"■ スクリーニング上位{len(scored_stocks)}銘柄")
     if scored_stocks:
         for i, s in enumerate(scored_stocks, start=1):
@@ -694,7 +697,7 @@ def build_fallback_text(market, scored_stocks, stats=None, validations=None,
 
 
 def build_report(market, scored_stocks, stats=None, validations=None,
-                 macro_context=None, theme_ranking=None):
+                 macro_context=None, theme_ranking=None, basis_label=None):
     """
     長文の詳細レポート全文（ターミナル表示・将来のWeb版／PDF版用）。
 
@@ -703,7 +706,7 @@ def build_report(market, scored_stocks, stats=None, validations=None,
     この関数はターミナルでの確認用、および将来の別チャネル（Web/PDF）向けに残している。
     """
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
-    parts = [f"【{TITLE}】", SUBTITLE, now, "", DESCRIPTION, ""]
+    parts = [f"【{TITLE}】", SUBTITLE, basis_label or "", f"配信 {now}", "", DESCRIPTION, ""]
 
     parts.append("■ 今日の市場概況")
     parts.append(format_market_section(market))
@@ -801,13 +804,16 @@ def _flex_star_box(title, stars_str, label, lines):
 
 
 def build_flex_message(market, scored_stocks, stats=None, validations=None,
-                       macro_context=None, theme_ranking=None, now_str=None):
+                       macro_context=None, theme_ranking=None, now_str=None,
+                       basis_label=None):
     """
     LINEの「サマリーカード」（トップページ）。1分で全体像がつかめる構成。
 
     今日の相場判定（★・非投資助言の市場環境判定）→ 集計 → 市場概況 →
     今日の主要テーマ＋最重要テーマの理由 → 今日強いテーマ → 本日のスクリーニング傾向
     → 上位5ランキング → 検証結果 → 今日の結論（★）→ 注意書き。
+
+    basis_label には「データ基準日：M月D日 大引け時点」を渡す（データ鮮度の明示）。
     """
     now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
     t = analyze_trend(market, scored_stocks, stats)
@@ -816,12 +822,15 @@ def build_flex_message(market, scored_stocks, stats=None, validations=None,
     strategy = si.daily_strategy(scored_stocks, theme_ranking, market, stats)
     top_theme = si.top_theme_reason(theme_ranking, macro_context)
 
+    header_contents = [_flex_text(TITLE, color="#FFFFFF", weight="bold", size="lg")]
+    if basis_label:
+        header_contents.append(_flex_text(basis_label, color="#FFFFFF", size="sm",
+                                          weight="bold", margin="sm"))
+    header_contents.append(
+        _flex_text(f"{SUBTITLE} ・ 配信 {now_str}", color="#C5D2F0", size="xxs", margin="xs"))
     header = {
         "type": "box", "layout": "vertical", "backgroundColor": "#0B3D91",
-        "paddingAll": "14px", "contents": [
-            _flex_text(TITLE, color="#FFFFFF", weight="bold", size="lg"),
-            _flex_text(f"{SUBTITLE} ・ {now_str}", color="#C5D2F0", size="xs", margin="sm"),
-        ],
+        "paddingAll": "14px", "contents": header_contents,
     }
 
     body = []

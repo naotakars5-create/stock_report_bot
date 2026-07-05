@@ -1,14 +1,20 @@
 name: Daily Stock Report
 
-# 平日（日本時間の月〜金）の朝7:03ごろに自動実行する。
-# GitHub Actions の cron は UTC で指定するため、JST 07:03 ≒ UTC 22:03（前日）。
+# 平日（日本時間の月〜金）の朝 8:15 JST（寄り付き 9:00 前）に自動実行する。
+# GitHub Actions の cron は UTC で指定するため、JST 08:15 = UTC 23:15（前日）。
 # 曜日も UTC 基準なので「UTC 日〜木(0-4)」が「JST 月〜金」に対応する（土日は配信しない）。
-# 毎時00分は GitHub Actions が最も混雑し遅延・欠落しやすいため、
-# あえて 03 分にずらして取りこぼしを減らす（GitHub のスケジューラはベストエフォート）。
-# 手動実行(workflow_dispatch)も可能。
+# 祝日・年末年始は main.py 側の休場日ガード(market_calendar.is_market_open)で
+# 配信をスキップする（cron だけでは祝日を除外できないため）。
+#
+# 【許容遅延】GitHub Actions のスケジューラはベストエフォートで、混雑時は数分〜
+# 数十分遅れて起動することがある。全銘柄の生成には約15〜20分かかるため、
+# 8:15 起動なら通常 8:35 前後に配信され、寄り付き(9:00)前に間に合う想定。
+# 遅延が大きい場合は 9:00 以降にずれ込む可能性がある点は許容範囲とする。
+# データは前日終値ベース（寄り付き前は当日場が未了のため、前営業日の大引け値）。
+# 手動実行(workflow_dispatch)も可能（休場日は main.py がスキップする）。
 on:
   schedule:
-    - cron: "3 22 * * 0-4"   # 22:03 UTC 日〜木 = 翌日 07:03 JST 月〜金
+    - cron: "15 23 * * 0-4"   # 23:15 UTC 日〜木 = 翌日 08:15 JST 月〜金
   workflow_dispatch:
 
 jobs:
@@ -40,6 +46,8 @@ jobs:
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          # データ異常・配信中止時の管理者通知先（未設定ならログのみ）。
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
         run: python main.py
 
       - name: 前回検証用の履歴を保存（コミット）

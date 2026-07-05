@@ -19,6 +19,7 @@ main.py
   7. 今回の抽出結果を履歴に保存（次回の検証用）
 """
 
+import argparse
 import os
 import sys
 from datetime import datetime
@@ -41,6 +42,7 @@ import stock_scorer
 import report_writer
 import report_history
 import line_sender
+import market_calendar
 
 
 def _int_env(name, default):
@@ -105,6 +107,27 @@ def _fetch_valuations(detail_histories):
     return valuations
 
 
+def _data_basis_date(*dfs):
+    """
+    取得した市場データ（TOPIX連動ETF・日経平均など）の最新バーの日付を返す。
+    ＝「このレポートが基づく立会い日（データ基準日）」。取得不可なら None。
+    """
+    for df in dfs:
+        try:
+            if df is not None and len(df.index):
+                return df.index[-1].date()
+        except Exception:
+            continue
+    return None
+
+
+def _basis_label(basis_date):
+    """ヘッダー表示用の『データ基準日：M月D日 大引け時点』ラベル。"""
+    if basis_date is None:
+        return "データ基準日：取得できませんでした"
+    return f"データ基準日：{basis_date.month}月{basis_date.day}日 大引け時点"
+
+
 def _attach_calendar(scored_stocks):
     """
     最終抽出（上位5）銘柄に、決算予定日・配当権利日を best-effort で付与する。
@@ -138,11 +161,22 @@ def _build_validations(current_prices, nikkei_df, benchmark_df, today_str):
     return validations
 
 
-def main():
+def main(dry_run=False):
     print("=" * 60)
     print("日本株 朝のスクリーニング速報（東証スクリーニング版）を開始します")
     print(f"  MAX_STOCKS = {MAX_STOCKS if MAX_STOCKS is not None else '全銘柄'}")
+    if dry_run:
+        print("  実行モード: DRY-RUN（LINE送信は行いません）")
     print("=" * 60)
+
+    # 【P0-1】休場日ガード: 土日・祝日・年末年始は配信せず正常終了(exit 0)。
+    #   スケジュール実行・手動実行(workflow_dispatch)の両方で先頭に判定する。
+    today = market_calendar.today_jst()
+    is_open, reason = market_calendar.is_market_open(today)
+    if not is_open:
+        print(f"Market closed: {today} ({reason})")
+        print("休場日のため配信をスキップして正常終了します。")
+        return 0
 
     # 0. JPX公式の上場銘柄一覧を最新化 → 普通株ユニバースを構築
     jpx_fetcher.ensure_jpx_csv(
@@ -195,12 +229,42 @@ def main():
               "相対強度は中立扱いになります。")
     nikkei_df = data_fetcher.get_nikkei_history()
 
-    # 過去レポート（検証用）を先に読み込む（当日を含めない）
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    # 【P0-2】データ鮮度ガード: 取得データの基準日が「今時点で確定している最新の
+    #   立会い日」より古い（データ提供側の遅延・キャッシュ等）なら、古いデータの
+    #   再配信を避けるため配信を中止し、管理者へLINE通知する。
+    basis_date = _data_basis_date(benchmark_df, nikkei_df)
+    expected_date = market_calendar.expected_data_date()
+    print(f"[鮮度] データ基準日={basis_date} / 期待基準日={expected_date}")
+    if basis_date is None:
+        print("[警告] データ基準日を判定できませんでした（市場データ取得失敗）。"
+              "配信は継続しますが、管理者に通知します。")
+        line_sender.send_admin_alert(
+            f"[Daily Stock Report] データ基準日を判定できませんでした。"
+            f"本日={today} / 期待基準日={expected_date}。市場データ取得に失敗した可能性。",
+            dry_run=dry_run)
+    elif basis_date < expected_date:
+        msg = (f"[Daily Stock Report] 配信を中止しました（データが古い）。\n"
+               f"ジョブ名: Daily Stock Report\n"
+               f"データ基準日: {basis_date}\n"
+               f"本日(JST): {today}\n"
+               f"期待される最新立会い日: {expected_date}\n"
+               f"→ 前日以前のデータの再配信を防ぐため中止しました。")
+        print("[中止] " + msg.replace("\n", " / "))
+        line_sender.send_admin_alert(msg, dry_run=dry_run)
+        return 0
+
+    # 過去レポート（検証用）を先に読み込む（当日を含めない）。日付はJSTで判定。
+    today_str = today.strftime("%Y-%m-%d")
     previous = report_history.load_previous(before_date=today_str)
     previous_codes = set()
     if previous:
         previous_codes = {(e.get("code") or "").strip() for e in previous["entries"]}
+        # 検証が参照する前回picksが「直近の営業日」かを確認（古ければ警告のみ）。
+        prev_expected = market_calendar.previous_trading_day(today)
+        prev_actual = (previous.get("run_date") or "").strip()
+        if prev_actual and prev_actual != prev_expected.strftime("%Y-%m-%d"):
+            print(f"[注意] 検証の参照picks({prev_actual})が直近営業日"
+                  f"({prev_expected})と一致しません（実行の欠落や休場の可能性）。")
 
     theme_ranking = []  # テーマ別ランキング（score_all が候補全体から集計して埋める）
 
@@ -261,19 +325,20 @@ def main():
     #              → (3)短い補足テキスト（ニュース／テーマ／検証のみ）
     #    銘柄ごとの詳細はカードに集約し、補足テキストでは繰り返さない。
     #    長文レポート(build_report)はターミナル確認・将来のWeb/PDF用で、LINEには送らない。
+    basis_label = _basis_label(basis_date)
     report = report_writer.build_report(
         market, scored_stocks, stats, validations=validations,
-        macro_context=macro_context, theme_ranking=theme_ranking)
+        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
     followup_text = report_writer.build_followup_text(
         market, scored_stocks, stats, validations=validations,
-        macro_context=macro_context, theme_ranking=theme_ranking)
+        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
     fallback_text = report_writer.build_fallback_text(
         market, scored_stocks, stats, validations=validations,
-        macro_context=macro_context, theme_ranking=theme_ranking)
+        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
     flex_messages = [
         report_writer.build_flex_message(
             market, scored_stocks, stats, validations=validations,
-            macro_context=macro_context, theme_ranking=theme_ranking)
+            macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
     ]
     cards = report_writer.build_stock_cards(scored_stocks, macro_context=macro_context)
     if cards:
@@ -282,31 +347,43 @@ def main():
     print(report)  # ターミナル表示のみ（LINEには送らない長文レポート）
     print("\n--- LINE補足テキスト（実際に送信する短縮版）---")
     print(followup_text)
-    _deliver(followup_text, flex_messages, fallback_text)
+    _deliver(followup_text, flex_messages, fallback_text, dry_run=dry_run)
 
-    # 7. 今回の抽出結果を履歴に保存（次回の検証用）
-    if scored_stocks:
+    # 7. 今回の抽出結果を履歴に保存（次回の検証用）。dry-run では状態を変更しない。
+    if scored_stocks and not dry_run:
         report_history.save_report(scored_stocks)
+    elif dry_run:
+        print("[DRY-RUN] 履歴CSVへの保存はスキップしました。")
 
     return 0
 
 
-def _deliver(followup_text, flex_messages=None, fallback_text=None):
+def _deliver(followup_text, flex_messages=None, fallback_text=None, dry_run=False):
     """
     レポートをLINEへ送信する（サマリーカード＋銘柄カルーセル＋短い補足テキスト）。
     Flex送信に失敗した場合のみ、短縮テキスト(fallback_text)へフォールバックする。
-    環境変数が未設定ならスキップ、失敗しても全体は止めない。
+    dry_run=True なら送信せず内容表示のみ。環境変数未設定ならスキップ、失敗しても止めない。
     """
     try:
         line_sender.send_report(
-            followup_text, flex_messages=flex_messages, fallback_text=fallback_text)
+            followup_text, flex_messages=flex_messages, fallback_text=fallback_text,
+            dry_run=dry_run)
     except Exception as e:
         print(f"[警告] LINE送信処理で予期せぬエラー（処理は継続）: {e}")
 
 
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="日本株 朝のスクリーニング速報（東証スクリーニング版）")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="LINEに送信せず、生成内容の表示のみ行う")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    _args = _parse_args()
     try:
-        exit_code = main()
+        exit_code = main(dry_run=_args.dry_run)
     except KeyboardInterrupt:
         print("\n[中断] ユーザーによって処理が中断されました。")
         exit_code = 130

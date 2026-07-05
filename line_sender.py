@@ -49,13 +49,59 @@ def get_credentials():
     """
     環境変数から認証情報を取得して返す。
 
+    TEST_USER_ID が設定されている場合は、配信先を **TEST_USER_ID に限定** する
+    （本番ユーザーには送らない・テスト配信モード）。
+
     戻り値:
         (channel_access_token, user_id)  未設定の項目は空文字
     """
     _load_dotenv()
     token = (os.environ.get("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
-    user_id = (os.environ.get("LINE_USER_ID") or "").strip()
+    test_user = (os.environ.get("TEST_USER_ID") or "").strip()
+    user_id = test_user or (os.environ.get("LINE_USER_ID") or "").strip()
+    if test_user:
+        print(f"[LINE] TEST_USER_ID が設定されているため、テストユーザーにのみ配信します。")
     return token, user_id
+
+
+def get_admin_user_id():
+    """管理者通知先（ADMIN_USER_ID）。未設定なら空文字。"""
+    _load_dotenv()
+    return (os.environ.get("ADMIN_USER_ID") or "").strip()
+
+
+def send_admin_alert(message, token=None, admin_id=None, timeout=20, dry_run=False):
+    """
+    管理者（ADMIN_USER_ID）へ運用アラートを LINE で送る（データ異常・配信中止など）。
+
+    ADMIN_USER_ID 未設定ならログ出力のみ（送信はスキップ）。dry_run 時も送信しない。
+    例外は送出しない（監視通知の失敗で本体を止めない）。
+    """
+    if admin_id is None:
+        admin_id = get_admin_user_id()
+    if token is None:
+        token, _ = get_credentials()
+    print(f"[ADMIN ALERT] {message}")
+    if dry_run:
+        print("[ADMIN ALERT] dry-run のため送信しません。")
+        return "skipped"
+    if not token or not admin_id:
+        print("[ADMIN ALERT] ADMIN_USER_ID / トークン未設定のため送信をスキップします。")
+        return "skipped"
+    if requests is None:
+        return "failed"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    payload = {"to": admin_id, "messages": [{"type": "text", "text": message[:4900]}]}
+    try:
+        resp = requests.post(LINE_PUSH_ENDPOINT, headers=headers, json=payload, timeout=timeout)
+        if resp.status_code == 200:
+            print("[ADMIN ALERT] 管理者へ通知しました。")
+            return "sent"
+        print(f"[ADMIN ALERT] 送信失敗: HTTP {resp.status_code} {resp.text}")
+        return "failed"
+    except Exception as e:
+        print(f"[ADMIN ALERT] 送信中に例外: {e}")
+        return "failed"
 
 
 def split_message(text, max_chars=MAX_CHARS_PER_MESSAGE):
@@ -127,7 +173,7 @@ def _post_batches(messages, headers, user_id, timeout, label):
 
 
 def send_report(followup_text, flex_messages=None, fallback_text=None,
-                token=None, user_id=None, timeout=30):
+                token=None, user_id=None, timeout=30, dry_run=False):
     """
     レポートをLINEへ「カード中心」で Push 送信する。
 
@@ -183,6 +229,14 @@ def send_report(followup_text, flex_messages=None, fallback_text=None,
     if not flex_msgs and not (followup_text or "").strip():
         print("[LINE] 送信する内容が空のためスキップします。")
         return "skipped"
+
+    # dry-run: 実際には送らず、送信予定の内容だけを表示して終了。
+    if dry_run:
+        print(f"[DRY-RUN] 送信は行いません。宛先={user_id[:6]}… / "
+              f"Flexカード {len(flex_msgs)} 件 / 補足テキスト {'あり' if followup_text else 'なし'}")
+        print("[DRY-RUN] --- 補足テキスト本文 ---")
+        print(followup_text or "(なし)")
+        return "dry-run"
 
     # 1. Flexメッセージ（サマリーカード＋銘柄カルーセル）
     flex_ok = True
