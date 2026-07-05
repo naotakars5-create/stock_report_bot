@@ -16,6 +16,11 @@ on:
   schedule:
     - cron: "15 23 * * 0-4"   # 23:15 UTC 日〜木 = 翌日 08:15 JST 月〜金
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: "休場日でも強制実行する（手動検証用。土日祝でも配信する）"
+        type: boolean
+        default: false
 
 jobs:
   report:
@@ -48,6 +53,8 @@ jobs:
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
           # データ異常・配信中止時の管理者通知先（未設定ならログのみ）。
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          # 手動実行で force_run=true のとき、休場日ガードを上書きして強制実行する。
+          FORCE_RUN: ${{ inputs.force_run }}
         run: python main.py
 
       - name: 前回検証用の履歴・日次集計を保存（コミット）

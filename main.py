@@ -171,12 +171,19 @@ def main(dry_run=False):
 
     # 【P0-1】休場日ガード: 土日・祝日・年末年始は配信せず正常終了(exit 0)。
     #   スケジュール実行・手動実行(workflow_dispatch)の両方で先頭に判定する。
+    #   ただし手動検証のため FORCE_RUN=true のときは休場日でも実行する（上書き）。
+    force_run = (os.environ.get("FORCE_RUN") or "").strip().lower() in ("1", "true", "yes", "on")
     today = market_calendar.today_jst()
     is_open, reason = market_calendar.is_market_open(today)
-    if not is_open:
+    if not is_open and not force_run:
         print(f"Market closed: {today} ({reason})")
         print("休場日のため配信をスキップして正常終了します。")
         return 0
+    if not is_open and force_run:
+        print(f"[強制実行] {today} は休場日（{reason}）ですが、FORCE_RUN のため実行します"
+              "（手動検証用）。休場日データの汚染を避けるため履歴・集計は保存しません。")
+    # 休場日の強制実行では、週末の据え置きデータで履歴を汚さないよう永続化を抑止する。
+    skip_persist = force_run and not is_open
 
     # 0. JPX公式の上場銘柄一覧を最新化 → 普通株ユニバースを構築
     jpx_fetcher.ensure_jpx_csv(
@@ -375,14 +382,16 @@ def main(dry_run=False):
     print(followup_text)
     _deliver(followup_text, flex_messages, fallback_text, dry_run=dry_run)
 
-    # 7. 今回の抽出結果を履歴に保存（次回の検証用）。dry-run では状態を変更しない。
-    if scored_stocks and not dry_run:
+    # 7. 今回の抽出結果を履歴に保存（次回の検証用）。
+    #    dry-run／休場日の強制実行では状態を変更しない（データ汚染防止）。
+    no_persist = dry_run or skip_persist
+    if scored_stocks and not no_persist:
         report_history.save_report(scored_stocks)
-    elif dry_run:
-        print("[DRY-RUN] 履歴CSVへの保存はスキップしました。")
+    elif no_persist:
+        print("[情報] 履歴・日次集計の保存はスキップしました（dry-run または休場日の強制実行）。")
 
     # 7.5 日次集計（通過率・前回検証成績）を保存（P1-3 パーセンタイル用の蓄積）。
-    if not dry_run:
+    if not no_persist:
         report_history.save_daily_stat(
             today_str, pass_rate, validations[0] if validations else None)
 
