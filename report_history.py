@@ -27,7 +27,7 @@ DEFAULT_PATH = os.path.join("data", "report_history.csv")
 # top_reason/top_risk は「検証の自己言及文」(P1-2)用に、その日の主な加点理由・
 # リスクメモを保存する。古いCSV（列が無い形式）でも DictReader で自動移行できる。
 FIELDS = ["run_date", "code", "name", "rank", "score", "price", "sector",
-          "theme_tags", "top_reason", "top_risk"]
+          "theme_tags", "size_category", "top_reason", "top_risk"]
 
 
 def _read_rows(path):
@@ -78,6 +78,7 @@ def save_report(scored_stocks, path=DEFAULT_PATH, run_date=None):
                 "price": f"{s.get('price', 0):.1f}",
                 "sector": s.get("sector", ""),
                 "theme_tags": _join_tags(s.get("theme_tags")),
+                "size_category": s.get("size_category", ""),
                 "top_reason": (s.get("top_reason") or "").strip(),
                 "top_risk": (s.get("top_risk") or "").strip(),
             })

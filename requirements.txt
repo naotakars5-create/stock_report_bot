@@ -7,6 +7,9 @@ python-dotenv>=1.0.0
 xlrd>=2.0.1
 # 休場日（祝日）判定に使用（market_calendar.py）。未導入でも土日・年末年始は判定可。
 jpholiday>=0.1.9
+# X(旧Twitter)への広報投稿に使用（promo/x_client.py）。
+# X_API_* が未設定なら投稿はスキップされるため、ローカル実行では無くても動く。
+tweepy>=4.14.0
 # 補助スクリプト get_line_user_id.py 用（本番の毎朝レポートでは未使用）
 flask>=3.0.0
 

@@ -382,6 +382,14 @@ def main(dry_run=False):
     print(followup_text)
     _deliver(followup_text, flex_messages, fallback_text, dry_run=dry_run)
 
+    # 6.5 【機能1-a】X へ朝ダイジェストを投稿（LINE配信の直後）。
+    #     休場日の強制実行では、休場日の内容を公開投稿しないようスキップする。
+    if skip_persist:
+        print("[X] 休場日の強制実行のため、X投稿はスキップします。")
+    else:
+        _post_morning_digest(today, market, scored_stocks, stats, theme_ranking,
+                             dry_run=dry_run)
+
     # 7. 今回の抽出結果を履歴に保存（次回の検証用）。
     #    dry-run／休場日の強制実行では状態を変更しない（データ汚染防止）。
     no_persist = dry_run or skip_persist
@@ -396,6 +404,27 @@ def main(dry_run=False):
             today_str, pass_rate, validations[0] if validations else None)
 
     return 0
+
+
+def _post_morning_digest(today, market, scored_stocks, stats, theme_ranking, dry_run=False):
+    """
+    【機能1-a】X(旧Twitter)へ朝ダイジェストを投稿する（LINE配信の直後）。
+
+    銘柄名は出さず、市況・温度感・強いテーマ＋LINE導線のみ。
+    X投稿の失敗で **LINE配信本体を落とさない** よう、全体を try/except で分離する。
+    """
+    try:
+        import stock_insights as si
+        from promo import promo_posts, text_builder, x_client
+        post_date = today.strftime("%Y-%m-%d")
+        if promo_posts.already_posted("morning_digest", post_date):
+            print("[X] 本日の朝ダイジェストは投稿済みのためスキップします。")
+            return
+        temp = si.daily_temperature(scored_stocks, market, stats)
+        text = text_builder.build_morning_digest(today, market, temp, theme_ranking)
+        x_client.post_tweet(text, "morning_digest", dry_run=dry_run, post_date=post_date)
+    except Exception as e:
+        print(f"[警告] X投稿(朝ダイジェスト)で予期せぬエラー（処理は継続）: {e}")
 
 
 def _deliver(followup_text, flex_messages=None, fallback_text=None, dry_run=False):
