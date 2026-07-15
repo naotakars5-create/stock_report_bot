@@ -27,7 +27,7 @@ DEFAULT_PATH = os.path.join("data", "report_history.csv")
 # top_reason/top_risk は「検証の自己言及文」(P1-2)用に、その日の主な加点理由・
 # リスクメモを保存する。古いCSV（列が無い形式）でも DictReader で自動移行できる。
 FIELDS = ["run_date", "code", "name", "rank", "score", "price", "sector",
-          "theme_tags", "top_reason", "top_risk"]
+          "theme_tags", "size_category", "top_reason", "top_risk"]
 
 
 def _read_rows(path):
@@ -78,6 +78,7 @@ def save_report(scored_stocks, path=DEFAULT_PATH, run_date=None):
                 "price": f"{s.get('price', 0):.1f}",
                 "sector": s.get("sector", ""),
                 "theme_tags": _join_tags(s.get("theme_tags")),
+                "size_category": s.get("size_category", ""),
                 "top_reason": (s.get("top_reason") or "").strip(),
                 "top_risk": (s.get("top_risk") or "").strip(),
             })
@@ -333,6 +334,19 @@ def _read_stats(path=STATS_PATH):
             return list(csv.DictReader(f))
     except Exception:
         return []
+
+
+def has_daily_stat(stat_date, path=STATS_PATH):
+    """
+    その日の集計が既に保存されているか＝**その日は既に配信済み**か。
+
+    daily_stats は配信のたびに（銘柄が0件でも）必ず1行保存されるため、
+    「同日に二重配信しない」ガードのマーカーとして使える。
+    外部cron(8:15)と予備のGitHub schedule(遅延起動)が両方走っても、
+    後から来た方はこの判定でスキップされる。
+    """
+    return any((r.get("stat_date") or "").strip() == stat_date
+               for r in _read_stats(path))
 
 
 def load_daily_stats(path=STATS_PATH, before_date=None):

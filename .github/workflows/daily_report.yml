@@ -6,15 +6,22 @@ name: Daily Stock Report
 # 祝日・年末年始は main.py 側の休場日ガード(market_calendar.is_market_open)で
 # 配信をスキップする（cron だけでは祝日を除外できないため）。
 #
-# 【許容遅延】GitHub Actions のスケジューラはベストエフォートで、混雑時は数分〜
-# 数十分遅れて起動することがある。全銘柄の生成には約15〜20分かかるため、
-# 8:15 起動なら通常 8:35 前後に配信され、寄り付き(9:00)前に間に合う想定。
-# 遅延が大きい場合は 9:00 以降にずれ込む可能性がある点は許容範囲とする。
+# 【重要・起動方法】GitHub の schedule は **実測で8〜14時間遅延** しており、
+# これに頼ると「朝の速報」が夕方〜夜に届いてしまう（cron式の問題ではなく、
+# private リポジトリのスケジューラがベストエフォートで大幅に遅延・間引かれるため）。
+# そのため **外部cron(cron-job.org 等)から repository_dispatch で起動する** のが本線。
+#   POST /repos/{owner}/{repo}/dispatches  {"event_type":"daily-report"}
+#   → 8:15 JST に分単位で正確に起動できる（README「配信時刻を正確にする」参照）。
+# 下の schedule は **保険**（外部cronが止まった場合の予備）として残す。遅れて起動しても
+# main.py の二重配信ガード（daily_stats に当日行があればスキップ）が重複配信を防ぐ。
+#
 # データは前日終値ベース（寄り付き前は当日場が未了のため、前営業日の大引け値）。
-# 手動実行(workflow_dispatch)も可能（休場日は main.py がスキップする）。
+# 祝日・年末年始は main.py の休場日ガードでスキップする。
 on:
+  repository_dispatch:
+    types: [daily-report]
   schedule:
-    - cron: "15 23 * * 0-4"   # 23:15 UTC 日〜木 = 翌日 08:15 JST 月〜金
+    - cron: "15 23 * * 0-4"   # 予備。23:15 UTC 日〜木 = 翌日 08:15 JST 月〜金（遅延あり）
   workflow_dispatch:
     inputs:
       force_run:
@@ -55,6 +62,12 @@ jobs:
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
           # 手動実行で force_run=true のとき、休場日ガードを上書きして強制実行する。
           FORCE_RUN: ${{ inputs.force_run }}
+          # 【機能1-a】朝ダイジェストのX投稿用（未設定なら投稿はスキップされる）。
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+          LINE_ADD_FRIEND_URL: ${{ secrets.LINE_ADD_FRIEND_URL }}
         run: python main.py
 
       - name: 前回検証用の履歴・日次集計を保存（コミット）

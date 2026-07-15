@@ -185,6 +185,16 @@ def main(dry_run=False):
     # 休場日の強制実行では、週末の据え置きデータで履歴を汚さないよう永続化を抑止する。
     skip_persist = force_run and not is_open
 
+    # 【二重配信ガード】同じ日に既に配信済みなら、何もせず正常終了する。
+    #   配信時刻の正確性のため外部cron(repository_dispatch)で起動しつつ、保険として
+    #   GitHubのschedule(遅延起動あり)も残しているため、両方走ると1日2回配信になり得る。
+    #   daily_stats は配信のたびに必ず1行保存されるので、それをマーカーに使う。
+    #   （dry-run と強制実行はテスト用途なので対象外）
+    today_str = today.strftime("%Y-%m-%d")
+    if not dry_run and not force_run and report_history.has_daily_stat(today_str):
+        print(f"[スキップ] 本日({today_str})は既に配信済みのため、重複配信を防いで終了します。")
+        return 0
+
     # 0. JPX公式の上場銘柄一覧を最新化 → 普通株ユニバースを構築
     jpx_fetcher.ensure_jpx_csv(
         JPX_CSV, auto_fetch=AUTO_FETCH_JPX, max_age_hours=JPX_CSV_MAX_AGE_HOURS,
@@ -260,8 +270,7 @@ def main(dry_run=False):
         line_sender.send_admin_alert(msg, dry_run=dry_run)
         return 0
 
-    # 過去レポート（検証用）を先に読み込む（当日を含めない）。日付はJSTで判定。
-    today_str = today.strftime("%Y-%m-%d")
+    # 過去レポート（検証用）を先に読み込む（当日を含めない）。日付はJST基準の today_str。
     previous = report_history.load_previous(before_date=today_str)
     previous_codes = set()
     if previous:
@@ -284,13 +293,15 @@ def main(dry_run=False):
     stats["primary_fetched"] = len(primary_histories)
     price_map = _build_price_map(primary_histories)
 
+    # 通過率（物色の裾野）には「絞り込み前の実際の通過数」を使う。
+    # top_n で切った後の件数だと常に一定（=PRIMARY_TOP_N）になり、通過率・相場判定・
+    # 温度感・パーセンタイルがすべて意味を失うため。
     passed, raw_passed = stock_scorer.screen_primary(
         primary_histories, min_avg_volume=MIN_AVG_VOLUME, top_n=PRIMARY_TOP_N,
     )
-    stats["primary_passed"] = len(passed)
-    stats["primary_passed_raw"] = raw_passed
-    print(f"一次スクリーニング: 条件合致 {raw_passed} 銘柄 → "
-          f"上位{PRIMARY_TOP_N}に絞り込み（{len(passed)} 銘柄）")
+    stats["primary_passed"] = raw_passed
+    print(f"一次スクリーニング通過: {raw_passed} 銘柄"
+          f"（二次スクリーニングは上位{PRIMARY_TOP_N}に絞り込み: {len(passed)} 銘柄）")
 
     # 4. 二次スクリーニング（7軸スコアリング）
     scored_stocks = []
@@ -346,13 +357,14 @@ def main(dry_run=False):
         s["top_reason"] = pr[0] if pr else ""
         s["top_risk"] = nr[0] if nr else ""
 
-    # P1-3: 条件合致率のパーセンタイル文脈（過去30営業日が貯まってから表示）。
-    #   上位50に絞った後の通過率(pass_rate)はほぼ毎日一定になるため、
-    #   絞り込み前の条件合致率(raw_pass_rate)を評価対象にする。
+    # P1-3: 通過率のパーセンタイル文脈（過去30営業日が貯まってから表示）。
+    #   通過率は絞り込み前の条件合致数ベース（primary_passed）。ただし過去の
+    #   daily_stats の pass_rate 列には「絞り込み後の固定値(約1.35)」時代の行が
+    #   混ざっているため、パーセンタイルは今回導入した raw_pass_rate 列だけで
+    #   評価し、意味の異なる指標が同じ分布に混在しないようにする。
     pass_rate = (stats["primary_passed"] / stats["universe"] * 100
                  if stats.get("universe") else None)
-    raw_pass_rate = (stats["primary_passed_raw"] / stats["universe"] * 100
-                     if stats.get("universe") else None)
+    raw_pass_rate = pass_rate
     hist_rows = report_history.load_daily_stats(before_date=today_str)
     raw_hist = []
     for r in hist_rows:
@@ -361,7 +373,7 @@ def main(dry_run=False):
         except (TypeError, ValueError):
             pass
     pctl = report_history.percentile_context(raw_pass_rate, raw_hist, kind="low")
-    pass_rate_ctx = f"条件合致率（絞り込み前）は{pctl}" if pctl else None
+    pass_rate_ctx = f"通過率は{pctl}" if pctl else None
 
     report = report_writer.build_report(
         market, scored_stocks, stats, validations=validations,
@@ -388,6 +400,14 @@ def main(dry_run=False):
     print(followup_text)
     _deliver(followup_text, flex_messages, fallback_text, dry_run=dry_run)
 
+    # 6.5 【機能1-a】X へ朝ダイジェストを投稿（LINE配信の直後）。
+    #     休場日の強制実行では、休場日の内容を公開投稿しないようスキップする。
+    if skip_persist:
+        print("[X] 休場日の強制実行のため、X投稿はスキップします。")
+    else:
+        _post_morning_digest(today, market, scored_stocks, stats, theme_ranking,
+                             dry_run=dry_run)
+
     # 7. 今回の抽出結果を履歴に保存（次回の検証用）。
     #    dry-run／休場日の強制実行では状態を変更しない（データ汚染防止）。
     no_persist = dry_run or skip_persist
@@ -403,6 +423,27 @@ def main(dry_run=False):
             raw_pass_rate=raw_pass_rate)
 
     return 0
+
+
+def _post_morning_digest(today, market, scored_stocks, stats, theme_ranking, dry_run=False):
+    """
+    【機能1-a】X(旧Twitter)へ朝ダイジェストを投稿する（LINE配信の直後）。
+
+    銘柄名は出さず、市況・温度感・強いテーマ＋LINE導線のみ。
+    X投稿の失敗で **LINE配信本体を落とさない** よう、全体を try/except で分離する。
+    """
+    try:
+        import stock_insights as si
+        from promo import promo_posts, text_builder, x_client
+        post_date = today.strftime("%Y-%m-%d")
+        if promo_posts.already_posted("morning_digest", post_date):
+            print("[X] 本日の朝ダイジェストは投稿済みのためスキップします。")
+            return
+        temp = si.daily_temperature(scored_stocks, market, stats)
+        text = text_builder.build_morning_digest(today, market, temp, theme_ranking)
+        x_client.post_tweet(text, "morning_digest", dry_run=dry_run, post_date=post_date)
+    except Exception as e:
+        print(f"[警告] X投稿(朝ダイジェスト)で予期せぬエラー（処理は継続）: {e}")
 
 
 def _deliver(followup_text, flex_messages=None, fallback_text=None, dry_run=False):

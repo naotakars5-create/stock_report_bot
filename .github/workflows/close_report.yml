@@ -1,0 +1,80 @@
+name: Close Report (X)
+
+# 【機能1-b】引け後の答え合わせを X(旧Twitter) へ投稿する。
+# 平日（日本時間の月〜金）の 16:10 JST に実行したい（大引け15:30の40分後）。
+#
+# 【重要・起動方法】GitHub の schedule は実測で大幅に遅延するため、正確な時刻で
+# 投稿したい場合は **外部cron から repository_dispatch で起動** する（本線）。
+#   POST /repos/{owner}/{repo}/dispatches  {"event_type":"close-report"}
+# 下の schedule は保険（遅れて起動しても、投稿済みなら promo_posts の重複判定で
+# スキップされる）。
+#
+# 祝日・年末年始は close_report.py 側の休場日ガードでスキップする。
+# 当日終値が未反映の場合は投稿せず中止し、管理者へ通知する（誤った成績を出さない）。
+on:
+  repository_dispatch:
+    types: [close-report]
+  schedule:
+    - cron: "10 7 * * 1-5"   # 予備。07:10 UTC 月〜金 = 同日 16:10 JST（遅延あり）
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Xに投稿せず、投稿予定文の表示のみ行う"
+        type: boolean
+        default: false
+      force_run:
+        description: "休場日でも強制実行する（手動検証用）"
+        type: boolean
+        default: false
+
+jobs:
+  close-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # 投稿履歴(data/promo_posts.csv)をコミットして永続化するため
+    permissions:
+      contents: write
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      - name: 引け後の答え合わせを X へ投稿
+        env:
+          # X(旧Twitter) API（未設定なら投稿はスキップされる）
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+          # 投稿末尾に付けるLINE友だち追加URL
+          LINE_ADD_FRIEND_URL: ${{ secrets.LINE_ADD_FRIEND_URL }}
+          # 中止・失敗時の管理者通知に使用
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          FORCE_RUN: ${{ inputs.force_run }}
+        run: python close_report.py ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: 投稿履歴を保存（コミット）
+        run: |
+          if [ ! -d data ]; then
+            echo "data ディレクトリが無いためスキップします。"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "投稿履歴に変更はありません。"
+          else
+            git commit -m "Update promo posts [skip ci]"
+            git push
+          fi

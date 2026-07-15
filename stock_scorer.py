@@ -105,12 +105,14 @@ def primary_screen(history, min_avg_volume=PRIMARY_MIN_AVG_VOLUME):
 
 def screen_primary(stock_histories, min_avg_volume=PRIMARY_MIN_AVG_VOLUME, top_n=50):
     """
-    一次スクリーニングを全銘柄に適用し、(通過銘柄リスト, キャップ前の条件合致数) を返す。
+    一次スクリーニングを全銘柄に適用し、
+    (通過銘柄リスト, 絞り込み前の条件合致数) のタプルを返す。
 
-    通過銘柄リストは primary_score 降順の上位 top_n 件。
-    キャップ前の条件合致数は「上位 top_n に絞る前に全条件を満たした銘柄数」で、
-    市場全体の広がり（ブレッドス）を示す。top_n で切り詰めた後の件数は
-    ほぼ毎日一定になるため、日次のパーセンタイル文脈づけ(P1-3)にはこちらを使う。
+    通過銘柄リストは二次スクリーニングに回す **上位 top_n 件だけ**
+    （primary_score 降順）。ただし「通過率（物色の裾野）」の指標には
+    **絞り込み前の実際の通過数**が必要。top_n で切った後の件数を使うと常に
+    top_n（＝一定値）になり、通過率も相場判定・温度感・パーセンタイル(P1-3)も
+    すべて意味を失うため、絞り込み前の件数を第2要素として返す。
     """
     passed = []
     for item in stock_histories:
