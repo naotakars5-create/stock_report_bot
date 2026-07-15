@@ -185,6 +185,16 @@ def main(dry_run=False):
     # 休場日の強制実行では、週末の据え置きデータで履歴を汚さないよう永続化を抑止する。
     skip_persist = force_run and not is_open
 
+    # 【二重配信ガード】同じ日に既に配信済みなら、何もせず正常終了する。
+    #   配信時刻の正確性のため外部cron(repository_dispatch)で起動しつつ、保険として
+    #   GitHubのschedule(遅延起動あり)も残しているため、両方走ると1日2回配信になり得る。
+    #   daily_stats は配信のたびに必ず1行保存されるので、それをマーカーに使う。
+    #   （dry-run と強制実行はテスト用途なので対象外）
+    today_str = today.strftime("%Y-%m-%d")
+    if not dry_run and not force_run and report_history.has_daily_stat(today_str):
+        print(f"[スキップ] 本日({today_str})は既に配信済みのため、重複配信を防いで終了します。")
+        return 0
+
     # 0. JPX公式の上場銘柄一覧を最新化 → 普通株ユニバースを構築
     jpx_fetcher.ensure_jpx_csv(
         JPX_CSV, auto_fetch=AUTO_FETCH_JPX, max_age_hours=JPX_CSV_MAX_AGE_HOURS,
@@ -260,8 +270,7 @@ def main(dry_run=False):
         line_sender.send_admin_alert(msg, dry_run=dry_run)
         return 0
 
-    # 過去レポート（検証用）を先に読み込む（当日を含めない）。日付はJSTで判定。
-    today_str = today.strftime("%Y-%m-%d")
+    # 過去レポート（検証用）を先に読み込む（当日を含めない）。日付はJST基準の today_str。
     previous = report_history.load_previous(before_date=today_str)
     previous_codes = set()
     if previous:
@@ -284,11 +293,17 @@ def main(dry_run=False):
     stats["primary_fetched"] = len(primary_histories)
     price_map = _build_price_map(primary_histories)
 
+    # 通過率（物色の裾野）には「絞り込み前の実際の通過数」を使う。
+    # top_n で切った後の件数だと常に一定（=PRIMARY_TOP_N）になり、通過率・相場判定・
+    # 温度感・パーセンタイルがすべて意味を失うため。
+    primary_stats = {}
     passed = stock_scorer.screen_primary(
         primary_histories, min_avg_volume=MIN_AVG_VOLUME, top_n=PRIMARY_TOP_N,
+        stats_out=primary_stats,
     )
-    stats["primary_passed"] = len(passed)
-    print(f"一次スクリーニング通過: {len(passed)} 銘柄（上位{PRIMARY_TOP_N}に絞り込み）")
+    stats["primary_passed"] = primary_stats.get("primary_passed_total", len(passed))
+    print(f"一次スクリーニング通過: {stats['primary_passed']} 銘柄"
+          f"（二次スクリーニングは上位{PRIMARY_TOP_N}に絞り込み: {len(passed)} 銘柄）")
 
     # 4. 二次スクリーニング（7軸スコアリング）
     scored_stocks = []

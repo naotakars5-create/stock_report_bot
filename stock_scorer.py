@@ -103,8 +103,19 @@ def primary_screen(history, min_avg_volume=PRIMARY_MIN_AVG_VOLUME):
     }
 
 
-def screen_primary(stock_histories, min_avg_volume=PRIMARY_MIN_AVG_VOLUME, top_n=50):
-    """一次スクリーニングを全銘柄に適用し、通過銘柄を primary_score 降順で返す。"""
+def screen_primary(stock_histories, min_avg_volume=PRIMARY_MIN_AVG_VOLUME, top_n=50,
+                   stats_out=None):
+    """
+    一次スクリーニングを全銘柄に適用し、通過銘柄を primary_score 降順で返す。
+
+    戻り値は二次スクリーニングに回す **上位 top_n 件だけ** に絞ったリスト。
+    ただし「通過率（物色の裾野）」の指標には、**絞り込み前の実際の通過数**が必要。
+    top_n で切った後の件数を使うと常に top_n（＝一定値）になり、通過率も相場判定・
+    温度感・パーセンタイルもすべて意味を失うため、絞り込み前の件数を stats_out に返す。
+
+    引数:
+        stats_out: dict を渡すと "primary_passed_total"（絞り込み前の通過数）を格納する。
+    """
     passed = []
     for item in stock_histories:
         result = primary_screen(item["history"], min_avg_volume=min_avg_volume)
@@ -114,6 +125,9 @@ def screen_primary(stock_histories, min_avg_volume=PRIMARY_MIN_AVG_VOLUME, top_n
         entry["primary_score"] = result["primary_score"]
         entry["price"] = result["price"]
         passed.append(entry)
+
+    if stats_out is not None:
+        stats_out["primary_passed_total"] = len(passed)
 
     passed.sort(key=lambda x: x["primary_score"], reverse=True)
     return passed[:top_n]

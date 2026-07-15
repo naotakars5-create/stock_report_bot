@@ -882,10 +882,49 @@ LINE_USER_ID=（手順3のU...から始まるID）
 - LINE認証情報は **GitHub Secrets** から環境変数として渡します。
 - 手動でも実行できます（Actionsタブ →「Daily Stock Report」→「Run workflow」）。
 
-> ⚠️ **許容遅延**: GitHubのcronは混雑状況により**数分〜数十分ずれて起動**することがあります（仕様）。
-> 全銘柄の生成に約15〜20分かかるため、8:15起動なら通常 **8:35前後に配信**され寄り付き（9:00）前に
-> 間に合う想定です。遅延が大きい日は9:00以降にずれ込む可能性があり、これは許容範囲としています。
-> より確実に寄り付き前へ届けたい場合は起動時刻を早めてください（例: JST 8:00 = `0 23 * * 0-4`）。
+### ⚠️ 配信時刻を正確にする（外部cron → repository_dispatch）
+
+**GitHub の `schedule` はあてになりません。** 本リポジトリでの実測では、指定時刻から
+**8〜14時間遅れて**起動していました（cron式の誤りではなく、private リポジトリの
+スケジューラがベストエフォートで大幅に遅延・間引かれるため）。
+
+| 起動(UTC) | 実際のJST | 意図 |
+|---|---|---|
+| 07-14 07:20Z | 16:20(火) | 8:15 |
+| 07-13 10:43Z | 19:43(月) | 8:15 |
+| 07-08 07:58Z | 16:58(水) | 8:15 |
+
+これに頼ると「朝の速報」が**夕方〜夜に届いて**しまい、寄り付き前ブリーフィングという
+価値が失われます。そこで **外部cronから `repository_dispatch` で起動**します（無料・サーバー不要）。
+
+**設定手順（初回のみ・5分程度）**
+
+1. GitHub で **Fine-grained personal access token** を発行
+   （対象リポジトリ: `stock_report_bot` / 権限: **Contents: Read and write**）
+2. 無料のホスト型cron（例: [cron-job.org](https://cron-job.org)）に登録し、ジョブを2つ作成:
+
+   | ジョブ | 実行時刻(JST) | URL |
+   |---|---|---|
+   | 朝の配信 | 平日 08:15 | `https://api.github.com/repos/naotakars5-create/stock_report_bot/dispatches` |
+   | 引け後の投稿 | 平日 16:10 | 同上 |
+
+3. 各ジョブの設定:
+   - Method: **POST**
+   - Headers:
+     - `Authorization: Bearer <発行したPAT>`
+     - `Accept: application/vnd.github+json`
+     - `Content-Type: application/json`
+   - Body: 朝は `{"event_type":"daily-report"}` / 引け後は `{"event_type":"close-report"}`
+   - タイムゾーンを **Asia/Tokyo**、曜日を **月〜金** に設定
+
+4. 成功すると HTTP **204** が返り、ジョブが即座に起動します。
+
+> **保険として GitHub の `schedule` も残しています。** 外部cronが止まっても、遅れて
+> でも配信されます。両方が走っても **二重配信ガード**（`daily_stats` に当日行があれば
+> スキップ）と**投稿の重複判定**（`promo_posts`）で、1日1回に保たれます。
+
+> 全銘柄の生成に約15〜20分かかるため、8:15 に正確起動できれば **8:35前後に配信**され、
+> 寄り付き（9:00）前に間に合います。
 
 ### GitHub Secrets の設定方法
 

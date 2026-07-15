@@ -329,6 +329,19 @@ def _read_stats(path=STATS_PATH):
         return []
 
 
+def has_daily_stat(stat_date, path=STATS_PATH):
+    """
+    その日の集計が既に保存されているか＝**その日は既に配信済み**か。
+
+    daily_stats は配信のたびに（銘柄が0件でも）必ず1行保存されるため、
+    「同日に二重配信しない」ガードのマーカーとして使える。
+    外部cron(8:15)と予備のGitHub schedule(遅延起動)が両方走っても、
+    後から来た方はこの判定でスキップされる。
+    """
+    return any((r.get("stat_date") or "").strip() == stat_date
+               for r in _read_stats(path))
+
+
 def load_daily_stats(path=STATS_PATH, before_date=None):
     """daily_stats を stat_date 昇順で返す（before_date 指定時はそれより前）。"""
     rows = _read_stats(path)
