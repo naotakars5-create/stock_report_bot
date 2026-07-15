@@ -296,13 +296,11 @@ def main(dry_run=False):
     # 通過率（物色の裾野）には「絞り込み前の実際の通過数」を使う。
     # top_n で切った後の件数だと常に一定（=PRIMARY_TOP_N）になり、通過率・相場判定・
     # 温度感・パーセンタイルがすべて意味を失うため。
-    primary_stats = {}
-    passed = stock_scorer.screen_primary(
+    passed, raw_passed = stock_scorer.screen_primary(
         primary_histories, min_avg_volume=MIN_AVG_VOLUME, top_n=PRIMARY_TOP_N,
-        stats_out=primary_stats,
     )
-    stats["primary_passed"] = primary_stats.get("primary_passed_total", len(passed))
-    print(f"一次スクリーニング通過: {stats['primary_passed']} 銘柄"
+    stats["primary_passed"] = raw_passed
+    print(f"一次スクリーニング通過: {raw_passed} 銘柄"
           f"（二次スクリーニングは上位{PRIMARY_TOP_N}に絞り込み: {len(passed)} 銘柄）")
 
     # 4. 二次スクリーニング（7軸スコアリング）
@@ -360,16 +358,21 @@ def main(dry_run=False):
         s["top_risk"] = nr[0] if nr else ""
 
     # P1-3: 通過率のパーセンタイル文脈（過去30営業日が貯まってから表示）。
+    #   通過率は絞り込み前の条件合致数ベース（primary_passed）。ただし過去の
+    #   daily_stats の pass_rate 列には「絞り込み後の固定値(約1.35)」時代の行が
+    #   混ざっているため、パーセンタイルは今回導入した raw_pass_rate 列だけで
+    #   評価し、意味の異なる指標が同じ分布に混在しないようにする。
     pass_rate = (stats["primary_passed"] / stats["universe"] * 100
                  if stats.get("universe") else None)
+    raw_pass_rate = pass_rate
     hist_rows = report_history.load_daily_stats(before_date=today_str)
-    pass_hist = []
+    raw_hist = []
     for r in hist_rows:
         try:
-            pass_hist.append(float(r.get("pass_rate")))
+            raw_hist.append(float(r.get("raw_pass_rate")))
         except (TypeError, ValueError):
             pass
-    pctl = report_history.percentile_context(pass_rate, pass_hist, kind="low")
+    pctl = report_history.percentile_context(raw_pass_rate, raw_hist, kind="low")
     pass_rate_ctx = f"通過率は{pctl}" if pctl else None
 
     report = report_writer.build_report(
@@ -416,7 +419,8 @@ def main(dry_run=False):
     # 7.5 日次集計（通過率・前回検証成績）を保存（P1-3 パーセンタイル用の蓄積）。
     if not no_persist:
         report_history.save_daily_stat(
-            today_str, pass_rate, validations[0] if validations else None)
+            today_str, pass_rate, validations[0] if validations else None,
+            raw_pass_rate=raw_pass_rate)
 
     return 0
 

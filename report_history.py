@@ -281,16 +281,22 @@ def build_pick_results(run, current_prices):
 
 # ====== 日次集計（P1-3: 通過率・成績のパーセンタイル表示用） ======
 STATS_PATH = os.path.join("data", "daily_stats.csv")
-STATS_FIELDS = ["stat_date", "pass_rate", "avg_change_pct", "vs_nikkei_pt",
-                "win_count", "lose_count"]
+# raw_pass_rate は「一次スクリーニングで上位50に絞る前に条件を満たした銘柄の比率」。
+# pass_rate（絞り込み後）はほぼ毎日一定になるため、パーセンタイル文脈づけ(P1-3)は
+# raw_pass_rate を対象にする。古いCSV（列が無い形式）は DictReader で自動移行され、
+# 過去行の raw_pass_rate は空欄のまま保持される（_floats が空欄をスキップする）。
+STATS_FIELDS = ["stat_date", "pass_rate", "raw_pass_rate", "avg_change_pct",
+                "vs_nikkei_pt", "win_count", "lose_count"]
 
 
-def save_daily_stat(stat_date, pass_rate, validation=None, path=STATS_PATH):
+def save_daily_stat(stat_date, pass_rate, validation=None, raw_pass_rate=None,
+                    path=STATS_PATH):
     """
     その日の集計値（通過率、および前回検証の成績）を daily_stats.csv に保存する。
 
     同じ stat_date の既存行は置き換える。失敗しても全体は止めない。
     validation は build_validation の戻り（前回上位5の成績）。無ければ成績列は空。
+    raw_pass_rate は上位50に絞る前の条件合致率（%）。P1-3 のパーセンタイル用。
     """
     try:
         directory = os.path.dirname(path)
@@ -302,6 +308,7 @@ def save_daily_stat(stat_date, pass_rate, validation=None, path=STATS_PATH):
         rows.append({
             "stat_date": stat_date,
             "pass_rate": f"{pass_rate:.2f}" if pass_rate is not None else "",
+            "raw_pass_rate": f"{raw_pass_rate:.2f}" if raw_pass_rate is not None else "",
             "avg_change_pct": f"{v.get('avg_return'):.2f}" if v.get("avg_return") is not None else "",
             "vs_nikkei_pt": f"{v.get('vs_nikkei'):.2f}" if v.get("vs_nikkei") is not None else "",
             "win_count": v.get("wins", ""),
@@ -372,12 +379,21 @@ def percentile_context(today_value, history_values, kind="low", window=30, min_n
     kind="low": 小さいほど目立つ（通過率＝絞られた水準）。
     kind="high": 大きいほど目立つ（成績＝良い水準）。
     データが min_n 未満なら None（表示しない）。window 件で評価する。
+
+    安全弁: 履歴がほぼ一定（低分散）のときと、今日の値と同値の履歴があるときは
+    順位が実質的に決められない（全員1位のような同率になる）ため None を返す。
+    固定値の系列に対して毎日「最も絞られた水準」と誤表示するのを防ぐ。
     """
     if today_value is None:
         return None
     hist = [v for v in (history_values or [])][-window:]
     if len(hist) < min_n:
         return None
+    eps = 1e-9
+    if max(hist) - min(hist) < eps:
+        return None  # 低分散: 履歴が実質同じ値しかなく順位付けに意味がない
+    if any(abs(v - today_value) < eps for v in hist):
+        return None  # 同値タイ: 順位が同率になり「最も◯◯」が誤解を招く
     n = len(hist)
     if kind == "low":
         rank = sum(1 for v in hist if v < today_value) + 1  # 小さい順の順位
