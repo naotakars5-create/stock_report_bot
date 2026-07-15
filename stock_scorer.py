@@ -104,7 +104,14 @@ def primary_screen(history, min_avg_volume=PRIMARY_MIN_AVG_VOLUME):
 
 
 def screen_primary(stock_histories, min_avg_volume=PRIMARY_MIN_AVG_VOLUME, top_n=50):
-    """一次スクリーニングを全銘柄に適用し、通過銘柄を primary_score 降順で返す。"""
+    """
+    一次スクリーニングを全銘柄に適用し、(通過銘柄リスト, キャップ前の条件合致数) を返す。
+
+    通過銘柄リストは primary_score 降順の上位 top_n 件。
+    キャップ前の条件合致数は「上位 top_n に絞る前に全条件を満たした銘柄数」で、
+    市場全体の広がり（ブレッドス）を示す。top_n で切り詰めた後の件数は
+    ほぼ毎日一定になるため、日次のパーセンタイル文脈づけ(P1-3)にはこちらを使う。
+    """
     passed = []
     for item in stock_histories:
         result = primary_screen(item["history"], min_avg_volume=min_avg_volume)
@@ -115,8 +122,9 @@ def screen_primary(stock_histories, min_avg_volume=PRIMARY_MIN_AVG_VOLUME, top_n
         entry["price"] = result["price"]
         passed.append(entry)
 
+    raw_passed = len(passed)
     passed.sort(key=lambda x: x["primary_score"], reverse=True)
-    return passed[:top_n]
+    return passed[:top_n], raw_passed
 
 
 # ====== 補助 ======

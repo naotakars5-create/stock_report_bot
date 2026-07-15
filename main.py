@@ -284,11 +284,13 @@ def main(dry_run=False):
     stats["primary_fetched"] = len(primary_histories)
     price_map = _build_price_map(primary_histories)
 
-    passed = stock_scorer.screen_primary(
+    passed, raw_passed = stock_scorer.screen_primary(
         primary_histories, min_avg_volume=MIN_AVG_VOLUME, top_n=PRIMARY_TOP_N,
     )
     stats["primary_passed"] = len(passed)
-    print(f"一次スクリーニング通過: {len(passed)} 銘柄（上位{PRIMARY_TOP_N}に絞り込み）")
+    stats["primary_passed_raw"] = raw_passed
+    print(f"一次スクリーニング: 条件合致 {raw_passed} 銘柄 → "
+          f"上位{PRIMARY_TOP_N}に絞り込み（{len(passed)} 銘柄）")
 
     # 4. 二次スクリーニング（7軸スコアリング）
     scored_stocks = []
@@ -344,18 +346,22 @@ def main(dry_run=False):
         s["top_reason"] = pr[0] if pr else ""
         s["top_risk"] = nr[0] if nr else ""
 
-    # P1-3: 通過率のパーセンタイル文脈（過去30営業日が貯まってから表示）。
+    # P1-3: 条件合致率のパーセンタイル文脈（過去30営業日が貯まってから表示）。
+    #   上位50に絞った後の通過率(pass_rate)はほぼ毎日一定になるため、
+    #   絞り込み前の条件合致率(raw_pass_rate)を評価対象にする。
     pass_rate = (stats["primary_passed"] / stats["universe"] * 100
                  if stats.get("universe") else None)
+    raw_pass_rate = (stats["primary_passed_raw"] / stats["universe"] * 100
+                     if stats.get("universe") else None)
     hist_rows = report_history.load_daily_stats(before_date=today_str)
-    pass_hist = []
+    raw_hist = []
     for r in hist_rows:
         try:
-            pass_hist.append(float(r.get("pass_rate")))
+            raw_hist.append(float(r.get("raw_pass_rate")))
         except (TypeError, ValueError):
             pass
-    pctl = report_history.percentile_context(pass_rate, pass_hist, kind="low")
-    pass_rate_ctx = f"通過率は{pctl}" if pctl else None
+    pctl = report_history.percentile_context(raw_pass_rate, raw_hist, kind="low")
+    pass_rate_ctx = f"条件合致率（絞り込み前）は{pctl}" if pctl else None
 
     report = report_writer.build_report(
         market, scored_stocks, stats, validations=validations,
@@ -393,7 +399,8 @@ def main(dry_run=False):
     # 7.5 日次集計（通過率・前回検証成績）を保存（P1-3 パーセンタイル用の蓄積）。
     if not no_persist:
         report_history.save_daily_stat(
-            today_str, pass_rate, validations[0] if validations else None)
+            today_str, pass_rate, validations[0] if validations else None,
+            raw_pass_rate=raw_pass_rate)
 
     return 0
 
