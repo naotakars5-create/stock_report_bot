@@ -70,10 +70,12 @@ jobs:
           LINE_ADD_FRIEND_URL: ${{ secrets.LINE_ADD_FRIEND_URL }}
         run: python main.py
 
-      - name: 前回検証用の履歴・日次集計を保存（コミット）
-        # スクリーニング結果の履歴(data/report_history.csv)と日次集計
-        # (data/daily_stats.csv)をリポジトリへ反映し、次回実行時の「前回レポートの
-        # 検証」「通過率のパーセンタイル表示(P1-3)」に使えるようにする。
+      - name: 前回検証用の履歴・日次集計・成績台帳・マクロ状態を保存（コミット）
+        # data/ 配下をリポジトリへ反映し、次回実行時の各機能に使えるようにする:
+        #   report_history.csv  … 前回レポートの検証
+        #   daily_stats.csv     … 通過率のパーセンタイル表示(P1-3)
+        #   pick_ledger.csv / performance_monthly.csv … 累積成績(機能4)の継続蓄積
+        #   macro_state.json    … マクロ鮮度(機能3)の前日比較の基準
         run: |
           if [ ! -d data ]; then
             echo "data ディレクトリが無いためスキップします。"
@@ -85,6 +87,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "履歴・集計に変更はありません。"
           else
-            git commit -m "Update report history and daily stats [skip ci]"
+            git commit -m "Update report history, stats, performance ledger and macro state [skip ci]"
             git push
           fi

@@ -96,6 +96,14 @@ def save_report(scored_stocks, path=DEFAULT_PATH, run_date=None):
         return False
 
 
+def all_history_rows(path=DEFAULT_PATH):
+    """履歴CSVの全行（run_date/code/name/rank/price/... の生dict）を返す。
+
+    成績台帳(performance.sync_ledger)が、過去の全コホート銘柄を取り込むために使う。
+    """
+    return _read_rows(path)
+
+
 def load_runs(path=DEFAULT_PATH, before_date=None):
     """
     履歴を実行日ごとにまとめ、新しい順のリストで返す。

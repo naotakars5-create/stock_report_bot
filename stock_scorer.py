@@ -158,6 +158,33 @@ def _daily_volatility(series, days=20):
     return float(returns.std() * 100)
 
 
+def _atr(history, period=14):
+    """
+    ATR(14)（平均真の値幅）を算出する。High/Low/Close から True Range を作り、
+    直近 period 本の平均を返す。列が欠けている場合は終値の値幅で近似し、
+    それも不可なら None（＝節目の算出でATRを使わない）。
+
+    ATR は「機械的に算出したボラティリティ指標」であり、売買の指示ではない。
+    下値メド（客観的な価格の節目）の算出根拠として用いる。
+    """
+    try:
+        close = history["Close"].dropna()
+        if len(close) < period + 1:
+            return None
+        high = history["High"] if "High" in history else close
+        low = history["Low"] if "Low" in history else close
+        prev_close = close.shift(1)
+        tr1 = (high - low).abs()
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).dropna()
+        if len(tr) < period:
+            return None
+        return float(tr.rolling(period).mean().iloc[-1])
+    except Exception:
+        return None
+
+
 def _clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
 
@@ -351,6 +378,7 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
         "sma5": sma5, "sma25": sma25, "sma75": sma75,
         "recent_high_20": _win_high(20), "recent_low_20": _win_low(20),
         "recent_high_60": _win_high(60), "recent_low_60": _win_low(60),
+        "atr14": _atr(history, 14),
     }
 
     return {

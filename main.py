@@ -41,6 +41,8 @@ import macro_analyzer
 import stock_scorer
 import report_writer
 import report_history
+import performance
+import macro_state
 import line_sender
 import market_calendar
 
@@ -145,6 +147,39 @@ def _attach_calendar(scored_stocks):
             print(f"[警告] カレンダー取得に失敗（中立扱い）: {s.get('name')} ({code}): {e}")
             s["calendar"] = {}
     return scored_stocks
+
+
+def _build_performance(today_str, nikkei_df, persist=True):
+    """
+    【機能4】成績台帳を同期し、累積成績サマリー（月次含む）を作る。
+
+    過去コホート（report_history の全上位5銘柄）を成績台帳に取り込み、5立会い日
+    保有・週次非重複・等加重の複利連鎖で累積成績を集計する。1銘柄の exit 終値は
+    yfinance の日足から「抽出日終値の5立会い日後」を取得して確定する。
+    取得・集計に失敗しても配信本体は止めない（成績は「集計中」表示にフォールバック）。
+    """
+    def price_history_provider(code):
+        ticker = code if "." in str(code) else f"{code}.T"
+        # 5立会い日後の終値まで見られれば十分。3か月あれば直近コホートを確定できる。
+        return data_fetcher._download_history(ticker, period="3mo")
+
+    try:
+        history_rows = report_history.all_history_rows()
+        nikkei_close = nikkei_df if nikkei_df is not None else None
+        summary = performance.sync_and_summarize(
+            today_str, history_rows, price_history_provider,
+            benchmark_series=nikkei_close, persist=persist)
+        if summary.get("available"):
+            print(f"[成績] 累積リターン {summary['cum_return']:+.2f}% / "
+                  f"コホート勝率 {summary.get('cohort_win_rate', 0):.0f}% / "
+                  f"最大DD {summary.get('max_drawdown', 0):.1f}%（"
+                  f"{summary.get('chain_cohorts', 0)}コホート・非重複）")
+        else:
+            print("[成績] 累積成績は集計中（確定コホートが未成熟／不足）。")
+        return summary
+    except Exception as e:
+        print(f"[警告] 累積成績の集計で予期せぬエラー（集計中表示にフォールバック）: {e}")
+        return {"available": False, "monthly": []}
 
 
 def _build_validations(current_prices, nikkei_df, benchmark_df, today_str):
@@ -340,6 +375,19 @@ def main(dry_run=False):
     # 5. 過去レポートの検証（前回・3営業日前・1週間前を、データがある範囲で）
     validations = _build_validations(price_map, nikkei_df, benchmark_df, today_str)
 
+    # 5.5 【機能3】マクロ解説の鮮度担保: 前日配信のマクロ文と当日文の類似度を測り、
+    #     酷似（使い回し）や前日から数値変化のない項目を落とす。判定結果を
+    #     macro_context["_freshness"] に載せ、配信文生成側で「その日ならでは」に絞る。
+    prev_macro_state = macro_state.load_state()
+    macro_context["_freshness"] = macro_state.evaluate_freshness(
+        macro_context, market=market, prev_state=prev_macro_state)
+
+    # 5.6 【機能4】累積成績: 過去コホート（上位5銘柄）を成績台帳に反映し、5立会い日
+    #     保有・週次非重複・等加重の複利連鎖で累積リターン/勝率/最大DD/月次を算出する。
+    #     dry-run／休場日の強制実行では台帳・月次を永続化しない（データ汚染防止）。
+    no_persist = dry_run or skip_persist
+    performance_summary = _build_performance(today_str, nikkei_df, persist=not no_persist)
+
     # 6. レポート出力（LINEは「カード中心」）
     #    LINE送信順: (1)サマリーカード → (2)上位5銘柄の横スライドカード
     #              → (3)短い補足テキスト（ニュース／テーマ／検証のみ）
@@ -380,16 +428,18 @@ def main(dry_run=False):
         macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
     followup_text = report_writer.build_followup_text(
         market, scored_stocks, stats, validations=validations,
-        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
+        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label,
+        performance=performance_summary)
     fallback_text = report_writer.build_fallback_text(
         market, scored_stocks, stats, validations=validations,
-        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
+        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label,
+        performance=performance_summary)
     flex_messages = [
         report_writer.build_flex_message(
             market, scored_stocks, stats, validations=validations,
             macro_context=macro_context, theme_ranking=theme_ranking,
             basis_label=basis_label, pass_rate_ctx=pass_rate_ctx,
-            self_ref_lines=self_ref_lines)
+            self_ref_lines=self_ref_lines, performance=performance_summary)
     ]
     cards = report_writer.build_stock_cards(scored_stocks, macro_context=macro_context)
     if cards:
@@ -410,11 +460,15 @@ def main(dry_run=False):
 
     # 7. 今回の抽出結果を履歴に保存（次回の検証用）。
     #    dry-run／休場日の強制実行では状態を変更しない（データ汚染防止）。
-    no_persist = dry_run or skip_persist
+    #    no_persist は 5.6 で算出済み（dry_run or skip_persist）。
     if scored_stocks and not no_persist:
         report_history.save_report(scored_stocks)
     elif no_persist:
         print("[情報] 履歴・日次集計の保存はスキップしました（dry-run または休場日の強制実行）。")
+
+    # 7.2 【機能3】当日のマクロ状態を保存（次回の鮮度判定＝前日比較の基準に使う）。
+    if not no_persist:
+        macro_state.save_state(macro_context, market=market, run_date=today_str)
 
     # 7.5 日次集計（通過率・前回検証成績）を保存（P1-3 パーセンタイル用の蓄積）。
     if not no_persist:
