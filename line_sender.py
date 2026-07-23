@@ -25,6 +25,15 @@ except ImportError:  # pragma: no cover
     requests = None
 
 
+def _record_usage(kind, recipients):
+    """送信成功分の通数を記録する（改善2・失敗しても送信処理は止めない）。"""
+    try:
+        import message_budget
+        message_budget.record(kind, recipients)
+    except Exception:
+        pass
+
+
 LINE_PUSH_ENDPOINT = "https://api.line.me/v2/bot/message/push"
 LINE_MULTICAST_ENDPOINT = "https://api.line.me/v2/bot/message/multicast"
 
@@ -99,6 +108,7 @@ def send_admin_alert(message, token=None, admin_id=None, timeout=20, dry_run=Fal
         resp = requests.post(LINE_PUSH_ENDPOINT, headers=headers, json=payload, timeout=timeout)
         if resp.status_code == 200:
             print("[ADMIN ALERT] 管理者へ通知しました。")
+            _record_usage("admin_alert", 1)
             return "sent"
         print(f"[ADMIN ALERT] 送信失敗: HTTP {resp.status_code} {resp.text}")
         return "failed"
@@ -164,6 +174,7 @@ def _post_batches(messages, headers, user_id, timeout, label):
             if resp.status_code == 200:
                 print(f"[LINE] {label} バッチ {bi}/{total} 送信成功"
                       f"（{len(batch)} メッセージ）")
+                _record_usage(label, 1)  # push: 1リクエスト×1人 = 1通
             else:
                 ok = False
                 # 失敗してもプログラムは止めない。原因がわかるよう本文を表示。
@@ -217,6 +228,7 @@ def send_multicast(message_objects, user_ids, token=None, timeout=30,
                                  json=payload, timeout=timeout)
             if resp.status_code == 200:
                 print(f"[LINE] {label}: {len(batch)}人へ送信成功（1通/人）。")
+                _record_usage(label, len(batch))  # multicast: 1リクエスト×人数
             else:
                 ok = False
                 print(f"[LINE] {label}: 送信失敗 HTTP {resp.status_code} {resp.text}")

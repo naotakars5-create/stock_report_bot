@@ -92,41 +92,63 @@ def _f(row, key):
 def _exit_after_sessions(close_series, entry_date_str, sessions=HOLDING_SESSIONS):
     """
     close_series（日付昇順の [(date, close), ...] または pandas Series）で、
-    entry_date の「5立会い日後の終値」を (exit_date_str, exit_price) で返す。
+    entry_date 起点の「N立会い日後の終値」を (exit_date_str, exit_price) で返す。
 
-    entry_date の行を起点に sessions 本先の終値。5本先が無ければ None（未成熟）。
-    entry_date に一致する行が無い場合は entry_date 以下で最も近い行を起点にする。
+    起点バーの決め方（集計基準の一貫性・重要）:
+      配信は朝（寄り付き前）に実行され、記録される entry_price は
+      **run_date より前の最新バー（＝前営業日終値）** である。後日取得した日足には
+      run_date 当日のバーも含まれるため、「entry_date 以下」で起点を取ると
+      記録価格のバーより1本後ろにずれ、銘柄リターン（記録価格起点）と
+      ベンチマーク窓（当日バー起点）の期間が食い違う。
+      → 起点は **run_date より前の最新バー** とする。過去バーが無い系列
+      （テスト・手動データ）のみ run_date 当日のバーにフォールバックする。
+
+    N本先が無ければ None（未成熟）。
     """
     pairs = _as_pairs(close_series)
     if not pairs:
         return None
-    # entry の位置（entry_date 以下で最も新しい行）
     idx = None
+    fallback = None
     for i, (d, _v) in enumerate(pairs):
-        if d <= entry_date_str:
+        if d < entry_date_str:
             idx = i
+        elif d == entry_date_str:
+            fallback = i
         else:
             break
+    if idx is None:
+        idx = fallback
     if idx is None:
         return None
     exit_idx = idx + sessions
     if exit_idx >= len(pairs):
-        return None  # まだ5立会い日先の終値が無い（未成熟）
+        return None  # まだN立会い日先の終値が無い（未成熟）
     ed, ep = pairs[exit_idx]
     return ed, float(ep)
 
 
 def _window_return(close_series, entry_date_str, exit_date_str):
-    """close_series の entry_date 起点〜exit_date 終点の騰落率(%)。算出不可は None。"""
+    """
+    close_series の entry_date 起点〜exit_date 終点の騰落率(%)。算出不可は None。
+
+    起点は _exit_after_sessions と同じ「entry_date より前の最新バー」
+    （無ければ当日バーにフォールバック）。銘柄リターンとベンチマーク窓の
+    期間を一致させるための基準統一。
+    """
     pairs = _as_pairs(close_series)
     if not pairs:
         return None
-    base = None
+    base = fallback = None
     for d, v in pairs:
-        if d <= entry_date_str:
+        if d < entry_date_str:
             base = float(v)
+        elif d == entry_date_str:
+            fallback = float(v)
         else:
             break
+    if base is None:
+        base = fallback
     end = None
     for d, v in pairs:
         if d <= exit_date_str:

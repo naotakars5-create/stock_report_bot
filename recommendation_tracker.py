@@ -349,6 +349,90 @@ def monthly_summary(tracks_path=TRACKS_PATH, recs_path=RECS_PATH):
     }
 
 
+# ====== 検証ビュー（前回/3営業日前/1週間前・price_tracks を単一ソースに） ======
+# 表示ラベルと (目標経過立会い日数, 使用する期間トラック) の対応。
+# 「前回」= 前営業日の掲載（1立会い日経過）→ 1d トラック、のように、
+# 経過日数と期間を一致させることで、summary カードの検証と price_tracks の
+# 追跡が **同じ生データ・同じ基準** から出る（2系統併走による食い違いの排除）。
+VALIDATION_TARGETS = (("前回", 1, "1d"), ("3営業日前", 3, "3d"), ("1週間前", 5, "5d"))
+
+
+def validation_views(today_str, recs_path=RECS_PATH, tracks_path=TRACKS_PATH,
+                     targets=VALIDATION_TARGETS):
+    """
+    検証ビュー（前回・3営業日前・1週間前）を price_tracks から一貫基準で作る。
+
+    従来の report_history 検証（当時価格 vs 今日の価格）と異なり、各回の成績を
+    「経過日数に対応する期間トラックの確定値」で表示する。銘柄・日経とも
+    performance の同一起点ロジックで確定した値なので、追跡・累積成績と数字が揃う。
+
+    戻り値: report_writer の検証表示と互換の dict リスト
+      [{label, run_date, evaluated, total, avg_return, wins, losses,
+        best, worst, nikkei_return, topix_return, vs_nikkei, vs_topix}, ...]
+    トラック未確定の回はスキップ（呼び出し側で従来検証にフォールバック可）。
+    """
+    recs = _read_csv(recs_path)
+    tracks = _read_csv(tracks_path)
+    by_rd = {}
+    for r in recs:
+        rd = (r.get("run_date") or "").strip()
+        if rd and rd < today_str:
+            by_rd.setdefault(rd, []).append(r)
+    track_map = {((t.get("run_date") or "").strip(), (t.get("code") or "").strip(),
+                  (t.get("horizon") or "").strip()): t for t in tracks}
+
+    out, used = [], set()
+    for label, age_target, horizon in targets:
+        best_rd, best_diff = None, None
+        for rd in by_rd:
+            if rd in used:
+                continue
+            age = performance._business_days_between(rd, today_str)
+            if age is None:
+                continue
+            diff = abs(age - age_target)
+            if best_diff is None or diff < best_diff:
+                best_rd, best_diff = rd, diff
+        if best_rd is None:
+            continue
+        entries = sorted(by_rd[best_rd],
+                         key=lambda r: int(r.get("rank") or 99)
+                         if str(r.get("rank") or "").isdigit() else 99)[:5]
+        results, nikkeis = [], []
+        for e in entries:
+            code = (e.get("code") or "").strip()
+            t = track_map.get((best_rd, code, horizon))
+            ret = _f(t, "return_pct") if t else None
+            if ret is None:
+                continue
+            results.append({"name": (e.get("name") or "").strip(),
+                            "code": code, "return": ret})
+            nk = _f(t, "nikkei_return_pct")
+            if nk is not None:
+                nikkeis.append(nk)
+        if not results:
+            continue  # この回の該当トラックが未確定（データ蓄積待ち）
+        used.add(best_rd)
+        avg = sum(r["return"] for r in results) / len(results)
+        nk_avg = (sum(nikkeis) / len(nikkeis)) if nikkeis else None
+        out.append({
+            "label": label,
+            "run_date": best_rd,
+            "evaluated": len(results),
+            "total": len(entries),
+            "avg_return": avg,
+            "wins": sum(1 for r in results if r["return"] > 0),
+            "losses": sum(1 for r in results if r["return"] <= 0),
+            "best": max(results, key=lambda r: r["return"]),
+            "worst": min(results, key=lambda r: r["return"]),
+            "nikkei_return": nk_avg,
+            "topix_return": None,
+            "vs_nikkei": (avg - nk_avg) if nk_avg is not None else None,
+            "vs_topix": None,
+        })
+    return out
+
+
 # ====== 移行（既存 pick_ledger.csv → 新形式・1回だけ） ======
 def migrate_from_pick_ledger(ledger_path=performance.LEDGER_PATH,
                              recs_path=RECS_PATH, tracks_path=TRACKS_PATH):

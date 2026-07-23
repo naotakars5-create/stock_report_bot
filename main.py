@@ -49,6 +49,7 @@ import recommendation_tracker
 import followup
 import subscriber_store
 import personalize
+import sector_valuation
 
 
 def _int_env(name, default):
@@ -466,11 +467,22 @@ def main(dry_run=False):
         # バリュエーション（best-effort）
         valuations = _fetch_valuations(detail_histories)
 
+        # 【改善3】業種PERキャッシュを更新し、業種中央値を上位銘柄に付与する。
+        #   selection_basis が「PER業種中央値以下（当社集計）」の判定に使う。
+        #   サンプル不足の業種は付与されず、従来の絶対水準判定にフォールバック。
+        sectors_map = {it["code"]: (it.get("sector") or "") for it in detail_histories}
+        if not (dry_run or skip_persist):
+            sector_valuation.update_cache(valuations, sectors_map, today_str)
+        sector_medians = sector_valuation.sector_medians()
+        if sector_medians:
+            print(f"[業種PER] 中央値を算出できた業種: {len(sector_medians)} 業種")
+
         scored_stocks = stock_scorer.score_all(
             detail_histories, benchmark_df=benchmark_df, top_n=FINAL_TOP_N,
             profiles=profiles_map, valuations=valuations, previous_codes=previous_codes,
             macro_context=macro_context, theme_ranking_out=theme_ranking,
         )
+        sector_valuation.attach_sector_median(scored_stocks, sector_medians)
     else:
         print("[情報] 一次スクリーニングを通過した銘柄はありませんでした。")
     stats["final"] = len(scored_stocks)
@@ -480,8 +492,25 @@ def main(dry_run=False):
         print("\n■ 上位銘柄の決算・配当カレンダーを取得（取得可能な範囲のみ）")
         _attach_calendar(scored_stocks)
 
-    # 5. 過去レポートの検証（前回・3営業日前・1週間前を、データがある範囲で）
-    validations = _build_validations(price_map, nikkei_df, benchmark_df, today_str)
+    # dry-run／休場日の強制実行／テスト配信では永続化しない（データ汚染防止）。
+    no_persist = dry_run or skip_persist
+
+    # 5. 【機能拡張1・2】推奨追跡: 多期間リターンの確定・満了クローズ・
+    #    朝配信に織り込む「追跡」セクション、月次成績レポートの生成。
+    #    ※検証ビューがこの確定データを使うため、検証より先に実行する。
+    tracking_lines, monthly_text = _build_tracking(
+        today_str, today, price_map, nikkei_df, persist=not no_persist)
+
+    # 5.2 検証（前回・3営業日前・1週間前）。price_tracks を単一ソースとし、
+    #     追跡・累積成績と同じ基準の確定値で表示する（2系統併走の食い違い排除）。
+    #     トラックがまだ無い移行期は、従来の report_history 検証にフォールバック。
+    validations = []
+    try:
+        validations = recommendation_tracker.validation_views(today_str)
+    except Exception as e:
+        print(f"[警告] 検証ビューの生成に失敗（従来方式へ）: {e}")
+    if not validations:
+        validations = _build_validations(price_map, nikkei_df, benchmark_df, today_str)
 
     # 5.5 【機能3】マクロ解説の鮮度担保: 前日配信のマクロ文と当日文の類似度を測り、
     #     酷似（使い回し）や前日から数値変化のない項目を落とす。判定結果を
@@ -492,14 +521,7 @@ def main(dry_run=False):
 
     # 5.6 【機能4】累積成績: 過去コホート（上位5銘柄）を成績台帳に反映し、5立会い日
     #     保有・週次非重複・等加重の複利連鎖で累積リターン/勝率/最大DD/月次を算出する。
-    #     dry-run／休場日の強制実行では台帳・月次を永続化しない（データ汚染防止）。
-    no_persist = dry_run or skip_persist
     performance_summary = _build_performance(today_str, nikkei_df, persist=not no_persist)
-
-    # 5.7 【機能拡張1・2】推奨追跡: 多期間リターンの確定・満了クローズ・
-    #     朝配信に織り込む「追跡」セクション、月次成績レポートの生成。
-    tracking_lines, monthly_text = _build_tracking(
-        today_str, today, price_map, nikkei_df, persist=not no_persist)
 
     # 6. レポート出力（LINEは「カード中心」）
     #    LINE送信順: (1)サマリーカード → (2)上位5銘柄の横スライドカード
@@ -576,6 +598,14 @@ def main(dry_run=False):
         _deliver(followup_text, flex_messages, fallback_text, dry_run=dry_run)
         if monthly_text:
             line_sender.send_report(monthly_text, dry_run=dry_run)
+
+    # 【改善2】メッセージ通数の残枠監視: 今日の送信で月間上限の80%/95%を跨いだら
+    #   管理者へ警告（枠切れによる配信停止を未然に防ぐ）。使用量ログも毎回出す。
+    import message_budget
+    print(message_budget.usage_line())
+    budget_alert = message_budget.threshold_alert()
+    if budget_alert:
+        line_sender.send_admin_alert(budget_alert, dry_run=dry_run)
 
     # 6.5 【機能1-a】X へ朝ダイジェストを投稿（LINE配信の直後）。
     #     休場日の強制実行では、休場日の内容を公開投稿しないようスキップする。

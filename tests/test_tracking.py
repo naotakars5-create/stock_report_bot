@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import followup                     # noqa: E402
 import personalize                  # noqa: E402
 import recommendation_tracker as rt  # noqa: E402
+import stock_insights as si         # noqa: E402
 import subscriber_store             # noqa: E402
 from promo import ng_words          # noqa: E402
 
@@ -267,6 +268,137 @@ def test_monthly_report_text_is_ng_clean():
     text = rw.build_monthly_report_text(msum, "2026年7月度まで")
     assert ng_words.check_ng(text) == [], ng_words.check_ng(text)
     assert "最大ドローダウン" in text and "超過" in text and "勝率" in text
+
+
+# ====== 改善1: 起点バーの一貫性＋検証ビューの一本化 ======
+def test_exit_anchor_uses_bar_before_run_date():
+    """
+    本番同様「run_dateより前のバー＝記録entry価格のバー」を起点にする。
+    朝実行では entry_price=前営業日終値のため、後日取得した日足に run_date 当日
+    バーがあっても、起点が1本後ろにずれてはいけない。
+    """
+    import performance
+    # 6/1(月)〜: 前営業日 6/5 に entry(=104)、run_date 6/8(月)
+    series = _series("2026-06-01", [100, 101, 102, 103, 104,   # 6/1-6/5
+                                    105, 106, 107, 108, 109, 110])  # 6/8-
+    ex = performance._exit_after_sessions(series, "2026-06-08", sessions=5)
+    assert ex is not None
+    _ed, ep = ex
+    # 起点=6/5(104) → 5本後=6/12(109)。当日バー起点なら110になってしまう。
+    assert ep == 109.0, f"起点が前営業日バーになっていない: {ep}"
+    # ベンチマーク窓も同じ起点（6/5基準）
+    r = performance._window_return(series, "2026-06-08", _ed)
+    assert abs(r - (109 - 104) / 104 * 100) < 1e-9, f"窓リターンの起点が不一致: {r}"
+
+
+def test_validation_views_from_tracks():
+    """検証ビュー（前回=1d/3営業日前=3d/1週間前=5d）が price_tracks から作られる。"""
+    recs_path, tracks_path = _tmp("recs.csv"), _tmp("tracks.csv")
+    # 3回分の掲載（1・3・5立会い日前）
+    recs, tracks = [], []
+    for rd, ret1, ret3, ret5 in [
+        ("2026-07-22", 1.0, None, None),    # 前回（1営業日前）
+        ("2026-07-20", 0.5, 2.0, None),     # 3営業日前
+        ("2026-07-16", 0.2, 1.0, 4.0),      # 1週間前（5営業日前）
+    ]:
+        recs.append({"run_date": rd, "code": f"C{rd[-2:]}", "name": f"銘柄{rd[-2:]}",
+                     "rank": 1, "score": "8.0", "entry_price": "1000.00",
+                     "basis_conditions": "", "basis_count": "", "basis_total": "",
+                     "ref_upper": "", "ref_lower": "", "ref_hold": 5,
+                     "status": "open", "close_date": "", "close_reason": ""})
+        for h, ret in (("1d", ret1), ("3d", ret3), ("5d", ret5)):
+            if ret is None:
+                continue
+            tracks.append({"run_date": rd, "code": f"C{rd[-2:]}", "horizon": h,
+                           "snap_date": "2026-07-23", "price": "1010.00",
+                           "return_pct": f"{ret:.4f}",
+                           "nikkei_return_pct": f"{ret - 0.5:.4f}"})
+    rt._write_csv(recs_path, rt.REC_FIELDS, recs)
+    rt._write_csv(tracks_path, rt.TRACK_FIELDS, tracks)
+
+    views = rt.validation_views("2026-07-23", recs_path=recs_path,
+                                tracks_path=tracks_path)
+    by_label = {v["label"]: v for v in views}
+    assert "前回" in by_label and by_label["前回"]["run_date"] == "2026-07-22"
+    assert abs(by_label["前回"]["avg_return"] - 1.0) < 1e-6
+    assert abs(by_label["前回"]["vs_nikkei"] - 0.5) < 1e-6
+    assert by_label["3営業日前"]["run_date"] == "2026-07-20"
+    assert abs(by_label["3営業日前"]["avg_return"] - 2.0) < 1e-6  # 3dトラックの値
+    assert by_label["1週間前"]["run_date"] == "2026-07-16"
+    assert abs(by_label["1週間前"]["avg_return"] - 4.0) < 1e-6   # 5dトラックの値
+
+
+def test_validation_views_empty_when_no_tracks():
+    """トラック未確定なら空リスト（呼び出し側が従来検証へフォールバック）。"""
+    recs_path, tracks_path = _tmp("recs.csv"), _tmp("tracks.csv")
+    rt.record_today([_stock()], run_date="2026-07-22", path=recs_path)
+    assert rt.validation_views("2026-07-23", recs_path=recs_path,
+                               tracks_path=tracks_path) == []
+
+
+# ====== 改善2: message_budget ======
+def test_message_budget_record_and_usage():
+    import message_budget as mb
+    path = _tmp("usage.csv")
+    mb.record("朝配信", 200, date_str="2026-07-01", path=path)
+    mb.record("朝配信", 200, date_str="2026-07-23", path=path)
+    mb.record("即時通知", 3, date_str="2026-07-23", path=path)
+    u = mb.month_usage(month="2026-07", path=path)
+    assert u["total"] == 403
+    # 今日分（today_jstに依存しないよう手動集計で確認）
+    rows = mb._read_rows(path)
+    assert sum(int(r["recipients"]) for r in rows if r["date"] == "2026-07-23") == 203
+
+
+def test_message_budget_threshold_alert(monkeypatch=None):
+    import message_budget as mb
+    path = _tmp("usage.csv")
+    today = __import__("market_calendar").today_jst().strftime("%Y-%m-%d")
+    month = today[:7]
+    # 上限5000の80% = 4000 を今日の送信で跨ぐ: 3900(過去) + 200(今日) = 4100
+    mb.record("朝配信", 3900, date_str=f"{month}-01", path=path)
+    assert mb.threshold_alert(path=path) is None or f"{month}-01" == today  # 過去分のみでは発火しない
+    mb.record("朝配信", 200, date_str=today, path=path)
+    alert = mb.threshold_alert(path=path)
+    assert alert is not None and "80%" in alert, alert
+    from promo import ng_words
+    assert ng_words.check_ng(alert) == []
+
+
+# ====== 改善3: 業種PER中央値 ======
+def test_sector_medians_and_fallback():
+    import sector_valuation as sv
+    path = _tmp("per_cache.csv")
+    vals = {f"C{i}": {"per": 10.0 + i} for i in range(6)}       # 10..15 → 中央値12.5
+    sectors = {f"C{i}": "電気機器" for i in range(6)}
+    sectors["C5"] = "サービス業"                                  # 1件だけ → サンプル不足
+    vals["C5"] = {"per": 30.0}
+    n = sv.update_cache(vals, sectors, today_str="2026-07-23", path=path)
+    assert n == 6
+    med = sv.sector_medians(path=path)
+    assert "電気機器" in med and abs(med["電気機器"]["median"] - 12.0) < 1e-6
+    assert "サービス業" not in med, "サンプル不足の業種は中央値を出さない"
+
+    # selection_basis: 中央値ありなら「業種中央値以下」で判定
+    s = _stock()
+    s["metrics"]["per"] = 11.0
+    s["sector"] = "電気機器"
+    sv.attach_sector_median([s], med)
+    basis = si.selection_basis(s)
+    joined = " / ".join(basis["items"])
+    assert "業種中央値" in joined, joined
+    # 中央値より高PERなら不一致（項目に出ない）
+    s2 = _stock(code="9991")
+    s2["metrics"]["per"] = 25.0
+    s2["sector"] = "電気機器"
+    sv.attach_sector_median([s2], med)
+    assert "業種中央値" not in " / ".join(si.selection_basis(s2)["items"])
+    # 中央値が無い業種は従来の絶対水準にフォールバック
+    s3 = _stock(code="9992")
+    s3["metrics"]["per"] = 12.0
+    s3["sector"] = "サービス業"
+    sv.attach_sector_median([s3], med)
+    assert "割安圏" in " / ".join(si.selection_basis(s3)["items"])
 
 
 def _run_all():

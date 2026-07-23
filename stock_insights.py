@@ -262,17 +262,26 @@ def selection_basis(s):
         bool(tags),
         ("テーマ該当：" + "・".join(tags[:3]) if tags else ""),
     ))
-    # 割安圏（PER/PBR の客観水準。※業種中央値比は現状データ未対応のため水準で提示）
-    val_evaluable = (per is not None and per > 0) or (pbr is not None and pbr > 0)
-    val_match = (per is not None and 0 < per <= 20) or (pbr is not None and 0 < pbr <= 1.2)
-    val_txt = ""
-    if val_match:
-        bits = []
-        if per is not None and 0 < per <= 20:
-            bits.append(f"PER{per:.1f}倍")
-        if pbr is not None and 0 < pbr <= 1.2:
-            bits.append(f"PBR{pbr:.2f}倍")
-        val_txt = "割安圏（" + "・".join(bits) + "）"
+    # 割安圏。業種PER中央値（sector_valuation のローリングキャッシュ・当社集計）が
+    # あれば「PER 業種中央値以下」で判定し、無ければ従来の絶対水準にフォールバック。
+    sector_med = s.get("sector_per_median")
+    if per is not None and per > 0 and sector_med:
+        val_evaluable = True
+        val_match = per <= sector_med
+        val_txt = (f"PER{per:.1f}倍 ≤ 業種中央値{sector_med:.1f}倍（当社集計）"
+                   if val_match else "")
+    else:
+        val_evaluable = (per is not None and per > 0) or (pbr is not None and pbr > 0)
+        val_match = ((per is not None and 0 < per <= 20)
+                     or (pbr is not None and 0 < pbr <= 1.2))
+        val_txt = ""
+        if val_match:
+            bits = []
+            if per is not None and 0 < per <= 20:
+                bits.append(f"PER{per:.1f}倍")
+            if pbr is not None and 0 < pbr <= 1.2:
+                bits.append(f"PBR{pbr:.2f}倍")
+            val_txt = "割安圏（" + "・".join(bits) + "）"
     checks.append((val_evaluable, val_match, val_txt))
     checks.append((
         True,
