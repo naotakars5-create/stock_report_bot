@@ -409,6 +409,78 @@ $env:MAX_STOCKS = "all"; python main.py   # none / 0 でも全銘柄
 
 ---
 
+## 機能拡張：成績蓄積・追跡・パーソナライズ
+
+「毎朝送りっぱなしの単発情報」から「継続する価値のあるサービス」への転換のための3機能。
+
+### 全体アーキテクチャ
+
+```
+【毎朝バッチ】GitHub Actions（既存・外部cron起動）
+  データ取得 → スクリーニング → 推奨記録（該当条件・目安レベル込み）
+  → 多期間リターン追跡（1日/3営/1週/1ヶ月・対日経） → 満了クローズ
+  → 朝イベント判定 → 「追跡」セクション生成 → 月次レポート（月初のみ）
+  → 読者設定取得（Worker API）→ 価格帯フィルタ → multicast配信（1通/人に束ねる）
+
+【場中モニタ】GitHub Actions（外部cronで30分毎 9:00–15:30・intraday_monitor.yml）
+  監視中銘柄の現在値 → イベント判定（上値メド到達／参考下値ライン割れ）
+  → 「気になる/保有」登録読者にのみ即時通知 → followup_events.csv 記録
+  （全読者へは翌朝の配信で必ず報告＝情報格差は1日以内・二重通知ガードあり）
+
+【常時稼働】Cloudflare Workers + D1（無料枠・webhook/ 配下）
+  LINE Webhook受信（署名検証）→ 読者設定をD1に保存
+  follow/unfollow で読者台帳を自動維持 → バッチ向け /export API（Bearer認証）
+```
+
+### データ設計（生データと集計の分離）
+
+**リポジトリCSV（生データ・追記のみ・git履歴で監査可能）**
+
+| ファイル | 内容 |
+|---|---|
+| `data/recommendations.csv` | 推奨の生記録＝ run_date / code / rank / score / entry_price / **basis_conditions（該当条件）** / **ref_upper・ref_lower（目安レベル数値）** / status / close_reason |
+| `data/price_tracks.csv` | 期間スナップショット＝ run_date × code × horizon(1d/3d/5d/20d) / snap_date / price / return_pct / **nikkei_return_pct（同窓の日経）** |
+| `data/followup_events.csv` | イベント記録＝ upper_hit / lower_break / expired ＋ notified（instant/morning/both＝二重通知ガード） |
+
+**Cloudflare D1（読者設定・Webhookが書き込み／バッチは読むだけ）**
+
+| テーブル | 内容 |
+|---|---|
+| `users` | user_id / price_cap（単元購入価格の上限・NULL=全銘柄）/ active（unfollowで0） |
+| `watch_items` | user_id / code / kind（interest=気になる・holding=保有） |
+
+個人情報は LINE userId と設定値のみ（保有株数・取得単価・氏名は設計上持たない）。
+集計（月次レポート・累積成績）は毎回生データから再計算し、後から集計方法を変えても
+過去に遡って一貫再集計できる。
+
+### メッセージ予算（ライトプラン 5,000通/月・読者200人時）
+
+LINEの課金は「送信リクエスト1回×受信者数＝通数」。1リクエスト内のメッセージ
+オブジェクト（最大5個）は1通扱いのため、**毎朝の配信は必ず1リクエストに束ねる**
+（サマリー＋カルーセル＋補足＋月次で4オブジェクト）。
+
+- 毎朝配信: 200人 × 22営業日 = 4,400通
+- 月次レポート: 朝配信に同梱のため追加0通
+- 即時通知: **登録読者のみ**が宛先（全読者一斉は行わない）→ 残枠約600通で運用
+- 設定操作への応答は reply API（応答メッセージ）のため課金対象外
+- 読者が215人を超えたらプラン見直しが必要（`personalize.group_users` はグループ数を
+  最小化するため、フィルタ利用者が増えても通数は増えない）
+
+### 段階的リリース計画
+
+| Phase | 内容 | 必要な準備 |
+|---|---|---|
+| 1 | 推奨記録＋多期間追跡＋月次レポート（`recommendation_tracker.py`） | なし（次回実行から自動蓄積。既存 pick_ledger は初回に自動移行） |
+| 2 | 追跡セクション＋満了クローズ＋場中モニタ（`followup.py` / `intraday_monitor.py`） | cron-job.org に intraday-monitor の30分毎ジョブを追加 |
+| 3 | パーソナライズ（`webhook/` / `subscriber_store.py` / `personalize.py`） | Cloudflareアカウント作成 → `webhook/wrangler.toml` の手順でデプロイ → GitHub Secrets に `SUBSCRIBER_API_URL` / `SUBSCRIBER_API_TOKEN` → `webhook/richmenu_setup.py` 実行 |
+
+Phase1-2 は追加インフラなしで動き、読者設定が無い間は従来通りの一斉配信になる
+（体験は劣化しない）。サンプルは `python samples/generate_extended_samples.py` で
+`samples/sample_delivery_v2.md`（追跡込み配信）と `samples/sample_monthly_report.md`
+（月次レポート）を生成できる。
+
+---
+
 ## LINE配信時の注意点
 
 - LINE配信は **「カード中心」** です。「**①サマリーカード → ②銘柄カルーセル（横スライドカード）

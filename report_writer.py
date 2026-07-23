@@ -722,6 +722,81 @@ def _performance_followup_lines(performance):
     return lines
 
 
+_HORIZON_LABELS = {"1d": "1日後", "3d": "3営業日後", "5d": "1週間後", "20d": "1ヶ月後"}
+
+
+def build_monthly_report_text(monthly_summary, month_label=None):
+    """
+    月次成績レポート（機能拡張1）。毎月最初の営業日に朝配信へ1通追加する。
+
+    含める内容（勝った月も負けた月も同じ書式・一貫基準）:
+      累積リターン／勝率／平均騰落率／最大ドローダウン／対日経の超過リターン
+      ＋期間別（1日/3営/1週/1ヶ月）の平均と勝率 ＋月次内訳表 ＋免責。
+    monthly_summary は recommendation_tracker.monthly_summary() の戻り値。
+    """
+    ms = monthly_summary or {}
+    p = ms.get("performance") or {}
+    lines = [f"【月次成績レポート】{month_label or ''}".rstrip(),
+             "", "⚠️ " + STRONG_DISCLAIMER_HEAD, ""]
+
+    if not p.get("available"):
+        lines.append("成績は集計中です（確定した掲載銘柄がまだ不足しています）。")
+        lines.append("集計基準: 掲載日終値→5立会い日後終値で確定・等加重・"
+                     "週次非重複の複利連鎖。蓄積が進み次第、毎月同じ基準で開示します。")
+        lines.append("")
+        lines.append("⚠️ " + STRONG_DISCLAIMER_TAIL)
+        return "\n".join(lines)
+
+    vs = p.get("cum_vs_nikkei")
+    lines.append("■ 累積成績（スクリーニング上位群 vs 日経平均）")
+    lines.append(f"・累積リターン：{p['cum_return']:+.2f}%"
+                 + (f"（日経 {p['cum_nikkei']:+.2f}% / 超過 {vs:+.2f}pt）"
+                    if vs is not None else ""))
+    if p.get("cohort_win_rate") is not None:
+        lines.append(f"・勝率：コホート {p['cohort_win_rate']:.1f}%"
+                     + (f" / 銘柄 {p['pick_win_rate']:.1f}%"
+                        if p.get("pick_win_rate") is not None else ""))
+    if p.get("avg_cohort_return") is not None:
+        lines.append(f"・平均騰落率（コホート）：{p['avg_cohort_return']:+.2f}%")
+    if p.get("max_drawdown") is not None:
+        lines.append(f"・最大ドローダウン：{p['max_drawdown']:.2f}%")
+    lines.append(f"・対象：{p.get('first_date','')}〜{p.get('last_date','')}"
+                 f"（{p.get('chain_cohorts',0)}コホート・{p.get('pick_count',0)}銘柄）")
+    lines.append("")
+
+    horizons = ms.get("horizons") or {}
+    if horizons:
+        lines.append("■ 期間別（全掲載銘柄・平均騰落率／勝率／対日経）")
+        for key in ("1d", "3d", "5d", "20d"):
+            h = horizons.get(key)
+            if not h:
+                continue
+            vsn = (f" / 対日経 {h['avg_vs_nikkei']:+.2f}pt"
+                   if h.get("avg_vs_nikkei") is not None else "")
+            lines.append(f"・{_HORIZON_LABELS[key]}：{h['avg_return']:+.2f}% / "
+                         f"勝率 {h['win_rate']:.0f}%{vsn}（{h['n']}件）")
+        lines.append("")
+
+    monthly = p.get("monthly") or []
+    if monthly:
+        lines.append("■ 月次内訳（月次 / 累積 / vs日経 / 勝率）")
+        for m in monthly:
+            mvs = m.get("cum_vs_nikkei")
+            mwr = m.get("cohort_win_rate")
+            lines.append(
+                f"{m['month']}: {m['month_return']:+.1f}% / {m['cum_return']:+.1f}% / "
+                + (f"{mvs:+.1f}pt" if mvs is not None else "—") + " / "
+                + (f"{mwr:.0f}%" if mwr is not None else "—"))
+        lines.append("")
+
+    lines.append("集計基準: 掲載日終値→5立会い日後終値で確定・等加重・週次非重複の"
+                 "複利連鎖。全期間を同一基準で集計し、期間の取り方による見せ方の操作は"
+                 "行いません。生データ（全掲載銘柄・全期間）は蓄積・保全しています。")
+    lines.append("")
+    lines.append("⚠️ " + STRONG_DISCLAIMER_TAIL)
+    return _clip_text("\n".join(lines), 4800)
+
+
 def _followup_validation_text(validations):
     """補足テキスト用の検証結果（最大3期間・勝敗／平均／市場比のみ・銘柄別は出さない）。"""
     validations = [v for v in (validations or []) if v]
@@ -743,7 +818,8 @@ def _followup_validation_text(validations):
 
 
 def _followup_sections(market, scored_stocks, stats, validations,
-                       macro_context, theme_ranking, performance=None):
+                       macro_context, theme_ranking, performance=None,
+                       tracking_lines=None):
     """
     補足テキスト（3通目）の本文＝**カードに載らない深掘り**。
 
@@ -801,6 +877,11 @@ def _followup_sections(market, scored_stocks, stats, validations,
     lines.extend(rows or ["（集計は蓄積中です）"])
     lines.append("")
 
+    # 掲載銘柄の追跡（機能拡張2: イベント＋監視中の経過。followup.build_morning_section の行）
+    if tracking_lines:
+        lines.extend(tracking_lines)
+        lines.append("")
+
     # 累積成績（月次・機能4）＝サービスの継続開示の中核
     lines.extend(_performance_followup_lines(performance))
     lines.append("")
@@ -812,7 +893,7 @@ def _followup_sections(market, scored_stocks, stats, validations,
 
 def build_followup_text(market, scored_stocks, stats=None, validations=None,
                         macro_context=None, theme_ranking=None, now_str=None,
-                        basis_label=None, performance=None):
+                        basis_label=None, performance=None, tracking_lines=None):
     """
     カードの後に送る「短い補足テキスト」（最大1500字・目安1000字以内）。
 
@@ -828,11 +909,11 @@ def build_followup_text(market, scored_stocks, stats=None, validations=None,
              "カードに載らないマクロ・テーマ・成績・検証の詳細です。", ""]
     parts.extend(_followup_sections(
         market, scored_stocks, stats, validations, macro_context, theme_ranking,
-        performance=performance))
+        performance=performance, tracking_lines=tracking_lines))
     parts.append("")
     parts.append("⚠️ " + STRONG_DISCLAIMER_TAIL)
-    # 深掘りレポートとして、マクロ/テーマ/成績/検証を収める（カードは短く・こちらは詳しく）。
-    return _clip_text("\n".join(parts), 2600)
+    # 深掘りレポートとして、マクロ/テーマ/追跡/成績/検証を収める（カードは短く・こちらは詳しく）。
+    return _clip_text("\n".join(parts), 2800)
 
 
 def build_fallback_text(market, scored_stocks, stats=None, validations=None,
@@ -1322,9 +1403,20 @@ def _stock_bubble(rank, s, macro_context=None, include_graph=True):
     body = {"type": "box", "layout": "vertical", "paddingAll": "18px",
             "spacing": "sm", "contents": body_contents}
 
+    # 「気になる」ボタン（機能拡張3）: 押した読者にだけ、この銘柄のフォローアップ
+    # （上値メド到達・参考下値ライン割れ・満了）を個別通知する。Webhook未設定の間は
+    # 押しても何も起きないだけで、配信自体には影響しない。
+    from urllib.parse import urlencode
+    interest_data = urlencode({"action": "interest", "code": s.get("code", ""),
+                               "name": (s.get("name") or "")[:40]})
     footer = {
         "type": "box", "layout": "vertical", "paddingAll": "12px", "spacing": "xs",
         "backgroundColor": "#FAFAFB", "contents": [
+            {"type": "button", "height": "sm", "style": "primary",
+             "color": pal["accent"],
+             "action": {"type": "postback", "data": interest_data,
+                        "displayText": f"「気になる」に登録: {s.get('name', '')}",
+                        "label": "⭐ 気になる（追跡通知を受け取る）"}},
             _flex_text("※売買推奨ではありません（公開データをもとにした機械的な抽出結果）",
                        size="xxs", color="#9AA0A6", wrap=True),
             _flex_text("← → 横スライドで他の銘柄も確認できます",

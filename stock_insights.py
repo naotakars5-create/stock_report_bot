@@ -132,7 +132,9 @@ def technical_levels(s):
         return {"support": "—", "resistance": "—", "range": "—",
                 "note": "価格データが取得できませんでした",
                 "downside": None, "downside_note": None,
-                "holding": None, "holding_note": None}
+                "holding": None, "holding_note": None,
+                "support_value": None, "resistance_value": None,
+                "downside_value": None}
 
     # 下値メド: 価格より下の節目のうち最も近いもの
     below = [("5日線", sma5), ("25日線", sma25), ("75日線", sma75),
@@ -141,8 +143,10 @@ def technical_levels(s):
     if below:
         lbl, v = max(below, key=lambda x: x[1])
         support = f"{_fmt_price(v)}（{lbl}）"
+        support_value = v
     else:
-        support = f"{_fmt_price(low60 or low20)}（直近安値）"
+        support_value = low60 or low20
+        support = f"{_fmt_price(support_value)}（直近安値）"
 
     # 上値メド: 価格より上の節目のうち最も近いもの。無ければ None（＝行ごと非表示）。
     above = [("直近20日高値", high20), ("直近60日高値", high60)]
@@ -150,8 +154,10 @@ def technical_levels(s):
     if above:
         lbl, v = min(above, key=lambda x: x[1])
         resistance = f"{_fmt_price(v)}（{lbl}）"
+        resistance_value = v
     else:
         resistance = None  # 直近高値を更新中 → 上値メドは非表示
+        resistance_value = None
 
     rng = None
     if low20 is not None and high20 is not None:
@@ -163,7 +169,7 @@ def technical_levels(s):
     #   ・ATR基準: 終値 − ATR(14)×2（平均的な値幅の2倍下）
     # 「この水準を下回ると下値方向のリスクが意識されやすい」機械的な目安であり、
     # 損切り指示ではない（NG語を避け『下値ライン』として提示）。
-    downside = downside_note = None
+    downside = downside_note = downside_value = None
     swing_low = None
     swing_below = [v for v in (low20, low60) if v is not None and v < price]
     if swing_below:
@@ -180,6 +186,7 @@ def technical_levels(s):
         if atr is not None and atr > 0 and "ATR(14)×2" not in basis:
             basis.append(f"ATR14={_fmt_price(atr)}")
         downside = _fmt_price(level)
+        downside_value = level
         pct = (level - price) / price * 100 if price else None
         gap = f"（現値比 {pct:+.1f}%）" if pct is not None else ""
         downside_note = f"根拠：{'・'.join(basis) or '直近安値'}{gap}。下回ると下値リスクが意識されやすい参考水準"
@@ -191,7 +198,10 @@ def technical_levels(s):
 
     return {"support": support, "resistance": resistance, "range": rng, "note": note,
             "downside": downside, "downside_note": downside_note,
-            "holding": holding, "holding_note": holding_note}
+            "holding": holding, "holding_note": holding_note,
+            # 数値レベル（推奨記録・フォローアップ判定用。表示は上の整形済み文字列を使う）
+            "support_value": support_value, "resistance_value": resistance_value,
+            "downside_value": downside_value}
 
 
 # ====== 選定根拠（どの条件に何個一致したか・機械的チェックリスト） ======

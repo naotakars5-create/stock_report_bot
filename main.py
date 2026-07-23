@@ -45,6 +45,10 @@ import performance
 import macro_state
 import line_sender
 import market_calendar
+import recommendation_tracker
+import followup
+import subscriber_store
+import personalize
 
 
 def _int_env(name, default):
@@ -180,6 +184,103 @@ def _build_performance(today_str, nikkei_df, persist=True):
     except Exception as e:
         print(f"[警告] 累積成績の集計で予期せぬエラー（集計中表示にフォールバック）: {e}")
         return {"available": False, "monthly": []}
+
+
+def _build_tracking(today_str, today, price_map, nikkei_df, persist=True):
+    """
+    【機能拡張1・2】推奨追跡の一括処理。
+
+      1. 既存 pick_ledger からの初回移行（冪等・persist時のみ）
+      2. 多期間（1d/3d/5d/20d）リターンの確定（price_tracks.csv 追記）
+      3. 目安保有期間（5立会い日）満了のクローズ＋満了イベント記録
+      4. 朝イベント判定（上値メド到達／参考下値ライン割れ・前日終値ベース）
+      5. 朝配信に織り込む「追跡」セクションの行を生成
+      6. 毎月最初の営業日なら月次成績レポートのテキストを生成
+
+    失敗しても配信本体は止めない。戻り値: (tracking_lines, monthly_text|None)
+    """
+    def provider(code):
+        ticker = code if "." in str(code) else f"{code}.T"
+        return data_fetcher._download_history(ticker, period="3mo")
+
+    tracking_lines, monthly_text = [], None
+    try:
+        if persist:
+            recommendation_tracker.migrate_from_pick_ledger()
+            recommendation_tracker.update_tracks(today_str, provider,
+                                                 nikkei_series=nikkei_df)
+            closed = recommendation_tracker.close_expired(today_str)
+            followup.record_expirations(closed, today_str=today_str)
+
+        # 朝のイベント判定（前日終値ベース）。場中モニタと同じ二重通知ガードを共有。
+        open_recs = recommendation_tracker.open_recommendations()
+        events = followup.detect_events(open_recs, price_map, today_str=today_str)
+        if events and persist:
+            followup.record_events(events)
+        tracking_lines = followup.build_morning_section(
+            events_today=events, open_recs=open_recs, current_prices=price_map,
+            persist=persist)
+
+        # 月次レポート: 毎月最初の営業日に1通（前月までの全期間を一貫基準で開示）。
+        prev_bd = market_calendar.previous_trading_day(today)
+        if prev_bd.month != today.month:
+            msum = recommendation_tracker.monthly_summary()
+            label = f"{prev_bd.year}年{prev_bd.month}月度まで"
+            monthly_text = report_writer.build_monthly_report_text(msum, label)
+            print(f"[月次] {label} の成績レポートを配信に追加します。")
+    except Exception as e:
+        print(f"[警告] 推奨追跡の処理で予期せぬエラー（配信は継続）: {e}")
+    return tracking_lines, monthly_text
+
+
+def _deliver_to_subscribers(flex_messages, followup_text, monthly_text=None,
+                            scored_stocks=None, dry_run=False):
+    """
+    【機能拡張3】読者への multicast 配信（読者設定があるときのみ使用）。
+
+    - 価格帯フィルタの結果が同じ読者をグループ化し、グループごとに
+      「サマリーカード＋（フィルタ済み）銘柄カルーセル＋補足テキスト（＋月次）」を
+      **1リクエストに束ねて** multicast（＝1通/人。メッセージ予算の最小化）。
+    - 設定なしの読者には全銘柄版が届く（従来体験の維持）。
+    戻り値: 配信した読者数（0 なら呼び出し側で従来配信にフォールバック）。
+    """
+    try:
+        settings = subscriber_store.load_settings()
+    except Exception as e:
+        print(f"[警告] 読者設定の取得に失敗（従来配信へ）: {e}")
+        return 0
+    users = [u for u in settings["users"] if u["active"]]
+    if not users:
+        return 0
+
+    groups = personalize.group_users(users, scored_stocks or [])
+    total = len(scored_stocks or [])
+    sent = 0
+    for g in groups:
+        msgs = []
+        # サマリーカードは全グループ共通（上位5の顔ぶれは透明性のため隠さない）
+        if flex_messages:
+            alt, contents = flex_messages[0]
+            msgs.append({"type": "flex", "altText": alt, "contents": contents})
+        # カルーセルはグループごとにフィルタ済み銘柄で再構築
+        cards = report_writer.build_stock_cards(g["stocks"]) if g["stocks"] else None
+        if cards:
+            msgs.append({"type": "flex", "altText": cards[0], "contents": cards[1]})
+        text = followup_text or ""
+        note = personalize.filtered_note(g, total)
+        if note:
+            text = note + "\n\n" + text
+        if text.strip():
+            msgs.append({"type": "text", "text": text[:4900]})
+        if monthly_text:
+            msgs.append({"type": "text", "text": monthly_text[:4900]})
+        status = line_sender.send_multicast(
+            msgs, g["user_ids"], dry_run=dry_run,
+            label=f"朝配信({'全銘柄版' if g['is_default'] else 'フィルタ版'}"
+                  f"・{len(g['user_ids'])}人)")
+        if status in ("sent", "dry-run"):
+            sent += len(g["user_ids"])
+    return sent
 
 
 def _build_validations(current_prices, nikkei_df, benchmark_df, today_str):
@@ -388,6 +489,11 @@ def main(dry_run=False):
     no_persist = dry_run or skip_persist
     performance_summary = _build_performance(today_str, nikkei_df, persist=not no_persist)
 
+    # 5.7 【機能拡張1・2】推奨追跡: 多期間リターンの確定・満了クローズ・
+    #     朝配信に織り込む「追跡」セクション、月次成績レポートの生成。
+    tracking_lines, monthly_text = _build_tracking(
+        today_str, today, price_map, nikkei_df, persist=not no_persist)
+
     # 6. レポート出力（LINEは「カード中心」）
     #    LINE送信順: (1)サマリーカード → (2)上位5銘柄の横スライドカード
     #              → (3)短い補足テキスト（ニュース／テーマ／検証のみ）
@@ -429,7 +535,7 @@ def main(dry_run=False):
     followup_text = report_writer.build_followup_text(
         market, scored_stocks, stats, validations=validations,
         macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label,
-        performance=performance_summary)
+        performance=performance_summary, tracking_lines=tracking_lines)
     fallback_text = report_writer.build_fallback_text(
         market, scored_stocks, stats, validations=validations,
         macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label,
@@ -448,7 +554,21 @@ def main(dry_run=False):
     print(report)  # ターミナル表示のみ（LINEには送らない長文レポート）
     print("\n--- LINE補足テキスト（実際に送信する短縮版）---")
     print(followup_text)
-    _deliver(followup_text, flex_messages, fallback_text, dry_run=dry_run)
+    if monthly_text:
+        print("\n--- 月次成績レポート（本日追加配信）---")
+        print(monthly_text)
+
+    # 【機能拡張3】読者設定があれば multicast（価格帯フィルタ・1通/人に束ねる）。
+    # 読者がいない・API未設定なら従来のLINE_USER_ID宛て配信（体験は劣化しない）。
+    delivered = _deliver_to_subscribers(
+        flex_messages, followup_text, monthly_text=monthly_text,
+        scored_stocks=scored_stocks, dry_run=dry_run)
+    if delivered:
+        print(f"[LINE] 読者 {delivered} 人へ multicast 配信しました。")
+    else:
+        _deliver(followup_text, flex_messages, fallback_text, dry_run=dry_run)
+        if monthly_text:
+            line_sender.send_report(monthly_text, dry_run=dry_run)
 
     # 6.5 【機能1-a】X へ朝ダイジェストを投稿（LINE配信の直後）。
     #     休場日の強制実行では、休場日の内容を公開投稿しないようスキップする。
@@ -463,6 +583,9 @@ def main(dry_run=False):
     #    no_persist は 5.6 で算出済み（dry_run or skip_persist）。
     if scored_stocks and not no_persist:
         report_history.save_report(scored_stocks)
+        # 【機能拡張1】推奨の生記録（該当条件・目安レベル込み）。フォローアップと
+        # 多期間追跡の土台になる。
+        recommendation_tracker.record_today(scored_stocks, run_date=today_str)
     elif no_persist:
         print("[情報] 履歴・日次集計の保存はスキップしました（dry-run または休場日の強制実行）。")
 

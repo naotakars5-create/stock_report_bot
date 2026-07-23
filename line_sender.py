@@ -26,11 +26,14 @@ except ImportError:  # pragma: no cover
 
 
 LINE_PUSH_ENDPOINT = "https://api.line.me/v2/bot/message/push"
+LINE_MULTICAST_ENDPOINT = "https://api.line.me/v2/bot/message/multicast"
 
 # LINEの上限は1テキスト5000文字。余裕をもって分割する。
 MAX_CHARS_PER_MESSAGE = 4800
 # 1回のpushリクエストに含められるメッセージ数の上限
 MAX_MESSAGES_PER_REQUEST = 5
+# multicast の1リクエストあたり宛先上限
+MAX_RECIPIENTS_PER_MULTICAST = 500
 
 
 def _load_dotenv():
@@ -170,6 +173,57 @@ def _post_batches(messages, headers, user_id, timeout, label):
             ok = False
             print(f"[LINE] {label} バッチ {bi}/{total} 送信中に例外: {e}")
     return ok
+
+
+def send_multicast(message_objects, user_ids, token=None, timeout=30,
+                   dry_run=False, label="multicast"):
+    """
+    同一内容のメッセージ束（最大5オブジェクト）を複数読者へ multicast 送信する。
+
+    メッセージ課金の最小化（重要）:
+      LINE の課金は「送信リクエスト1回×受信者数」でカウントされ、1リクエスト内の
+      メッセージオブジェクト（最大5個）はまとめて1通扱い。したがって毎朝の
+      サマリーカード＋銘柄カルーセル＋補足テキストは **必ず1リクエストに束ねて**
+      送る（read: ライトプラン5,000通/月で読者200人×22営業日=4,400通に収める）。
+
+    宛先は500人ずつに分割する。戻り値: "sent" / "skipped" / "failed"。
+    例外は送出しない。
+    """
+    user_ids = [u for u in (user_ids or []) if u]
+    if not user_ids or not message_objects:
+        return "skipped"
+    if len(message_objects) > MAX_MESSAGES_PER_REQUEST:
+        # 1通に収まらない場合は先頭5件に丸める（課金増を静かに起こさない）
+        print(f"[LINE] {label}: メッセージが{len(message_objects)}件のため"
+              f"先頭{MAX_MESSAGES_PER_REQUEST}件に丸めます（1通に収めるため）。")
+        message_objects = message_objects[:MAX_MESSAGES_PER_REQUEST]
+    if token is None:
+        token, _ = get_credentials()
+    if not token:
+        print(f"[LINE] {label}: トークン未設定のためスキップします。")
+        return "skipped"
+    if dry_run:
+        print(f"[DRY-RUN] {label}: {len(user_ids)}人へ {len(message_objects)}"
+              f"オブジェクト（=1通/人）を送信予定（送信はしません）。")
+        return "dry-run"
+    if requests is None:
+        return "failed"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    ok = True
+    for batch in _batched(user_ids, MAX_RECIPIENTS_PER_MULTICAST):
+        payload = {"to": batch, "messages": message_objects}
+        try:
+            resp = requests.post(LINE_MULTICAST_ENDPOINT, headers=headers,
+                                 json=payload, timeout=timeout)
+            if resp.status_code == 200:
+                print(f"[LINE] {label}: {len(batch)}人へ送信成功（1通/人）。")
+            else:
+                ok = False
+                print(f"[LINE] {label}: 送信失敗 HTTP {resp.status_code} {resp.text}")
+        except Exception as e:
+            ok = False
+            print(f"[LINE] {label}: 送信中に例外: {e}")
+    return "sent" if ok else "failed"
 
 
 def send_report(followup_text, flex_messages=None, fallback_text=None,
