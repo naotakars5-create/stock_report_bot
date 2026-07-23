@@ -309,25 +309,32 @@ def main(dry_run=False):
     #   スケジュール実行・手動実行(workflow_dispatch)の両方で先頭に判定する。
     #   ただし手動検証のため FORCE_RUN=true のときは休場日でも実行する（上書き）。
     force_run = (os.environ.get("FORCE_RUN") or "").strip().lower() in ("1", "true", "yes", "on")
+    # 【テスト配信モード】TEST_MODE=true: LINEには実際に配信する（内容確認用）が、
+    #   X投稿・履歴/集計/追跡データの保存は一切行わない（本番データ・公開投稿を汚さない）。
+    #   休場日・配信済みガードも上書きして、いつでも安全に試し配信できる。
+    test_mode = (os.environ.get("TEST_MODE") or "").strip().lower() in ("1", "true", "yes", "on")
+    if test_mode:
+        print("  実行モード: TEST_MODE（LINEに送信 / X投稿・データ保存はスキップ）")
     today = market_calendar.today_jst()
     is_open, reason = market_calendar.is_market_open(today)
-    if not is_open and not force_run:
+    if not is_open and not (force_run or test_mode):
         print(f"Market closed: {today} ({reason})")
         print("休場日のため配信をスキップして正常終了します。")
         return 0
-    if not is_open and force_run:
-        print(f"[強制実行] {today} は休場日（{reason}）ですが、FORCE_RUN のため実行します"
+    if not is_open and (force_run or test_mode):
+        print(f"[強制実行] {today} は休場日（{reason}）ですが実行します"
               "（手動検証用）。休場日データの汚染を避けるため履歴・集計は保存しません。")
-    # 休場日の強制実行では、週末の据え置きデータで履歴を汚さないよう永続化を抑止する。
-    skip_persist = force_run and not is_open
+    # 休場日の強制実行・テスト配信では、履歴を汚さないよう永続化と公開X投稿を抑止する。
+    skip_persist = (force_run and not is_open) or test_mode
 
     # 【二重配信ガード】同じ日に既に配信済みなら、何もせず正常終了する。
     #   配信時刻の正確性のため外部cron(repository_dispatch)で起動しつつ、保険として
     #   GitHubのschedule(遅延起動あり)も残しているため、両方走ると1日2回配信になり得る。
     #   daily_stats は配信のたびに必ず1行保存されるので、それをマーカーに使う。
-    #   （dry-run と強制実行はテスト用途なので対象外）
+    #   （dry-run・強制実行・テスト配信はテスト用途なので対象外）
     today_str = today.strftime("%Y-%m-%d")
-    if not dry_run and not force_run and report_history.has_daily_stat(today_str):
+    if (not dry_run and not force_run and not test_mode
+            and report_history.has_daily_stat(today_str)):
         print(f"[スキップ] 本日({today_str})は既に配信済みのため、重複配信を防いで終了します。")
         return 0
 
@@ -573,7 +580,7 @@ def main(dry_run=False):
     # 6.5 【機能1-a】X へ朝ダイジェストを投稿（LINE配信の直後）。
     #     休場日の強制実行では、休場日の内容を公開投稿しないようスキップする。
     if skip_persist:
-        print("[X] 休場日の強制実行のため、X投稿はスキップします。")
+        print("[X] 休場日の強制実行またはテスト配信のため、X投稿はスキップします。")
     else:
         _post_morning_digest(today, market, scored_stocks, stats, theme_ranking,
                              dry_run=dry_run)

@@ -28,6 +28,14 @@ on:
         description: "休場日でも強制実行する（手動検証用。土日祝でも配信する）"
         type: boolean
         default: false
+      test_mode:
+        description: "テスト配信（LINEに送信するが、X投稿・データ保存は行わない）"
+        type: boolean
+        default: false
+      max_stocks:
+        description: "対象銘柄数の上限（テスト時の短縮用。空=全銘柄）"
+        type: string
+        default: ""
 
 jobs:
   report:
@@ -62,6 +70,13 @@ jobs:
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
           # 手動実行で force_run=true のとき、休場日ガードを上書きして強制実行する。
           FORCE_RUN: ${{ inputs.force_run }}
+          # テスト配信: LINEに送るが X投稿・データ保存はスキップ（本番を汚さない）。
+          TEST_MODE: ${{ inputs.test_mode }}
+          # テスト時の短縮用（空=全銘柄）。
+          MAX_STOCKS: ${{ inputs.max_stocks }}
+          # 読者設定API（Worker未デプロイなら未設定のままでよい＝従来配信）。
+          SUBSCRIBER_API_URL: ${{ secrets.SUBSCRIBER_API_URL }}
+          SUBSCRIBER_API_TOKEN: ${{ secrets.SUBSCRIBER_API_TOKEN }}
           # 【機能1-a】朝ダイジェストのX投稿用（未設定なら投稿はスキップされる）。
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
@@ -83,6 +98,8 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 場中モニタ(intraday_monitor)も data/ をコミットするため、push衝突を避ける
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
           git add data/
           if git diff --staged --quiet; then
             echo "履歴・集計に変更はありません。"
