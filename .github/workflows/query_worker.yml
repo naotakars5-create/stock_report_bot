@@ -1,0 +1,38 @@
+name: Stock Query Worker
+
+# 銘柄Q&A（改善B）: 読者からの問い合わせ（Cloudflare Worker が D1 にキュー）を
+# 取得し、機械的評価を生成して LINE で回答する。
+#
+# 起動は外部cron（cron-job.org 等）からの repository_dispatch を本線とする。
+#   POST /repos/{owner}/{repo}/dispatches  {"event_type":"query-worker"}
+#   → 平日の場中〜夕方に数分〜十数分おきを推奨（受付時に「次の処理で送る」と案内済み）。
+# 未処理が無ければ即終了するので空振りは軽い。
+on:
+  repository_dispatch:
+    types: [query-worker]
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      - name: 銘柄Q&Aを処理
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          SUBSCRIBER_API_URL: ${{ secrets.SUBSCRIBER_API_URL }}
+          SUBSCRIBER_API_TOKEN: ${{ secrets.SUBSCRIBER_API_TOKEN }}
+        run: python query_worker.py

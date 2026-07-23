@@ -82,6 +82,65 @@ def test_report_builds_and_is_readable():
     assert "エッジ検証レポート" in text and "リスク調整指標" in text
 
 
+# ====== 改善A: scoring_profiles（balanced==現行 / defensive は別配点） ======
+def test_profiles_sum_to_ten():
+    import scoring_profiles as sp
+    for p in sp.PROFILES.values():
+        assert abs(sum(p["weights"].values()) - 10.0) < 1e-9
+
+
+def test_get_profile_defaults_balanced():
+    import scoring_profiles as sp
+    assert sp.get_profile(None)["name"] == "balanced"
+    assert sp.get_profile("unknown")["name"] == "balanced"
+    assert sp.get_profile("defensive")["name"] == "defensive"
+
+
+# ====== 改善B: stock_query（コード抽出・文面のNG語・免責） ======
+def test_parse_code():
+    import stock_query as sq
+    assert sq.parse_code("7203") == "7203"
+    assert sq.parse_code("評価 7203") == "7203"
+    assert sq.parse_code("トヨタ(7203)はどう？") == "7203"
+    assert sq.parse_code("130A") == "130A"
+    assert sq.parse_code("こんにちは") is None
+
+
+def test_query_answer_format_is_ng_clean():
+    import stock_query as sq
+    from promo import ng_words
+    # evaluate をモックして format_answer 単体を検証（ネットワーク不要）
+    evalr = {
+        "ok": True, "code": "7203", "name": "サンプル自動車", "score": 7.4,
+        "price": 3120.0,
+        "basis": {"summary": "該当7/9件",
+                  "items": ["出来高が5日平均で25日平均比 +40%", "25日線を上回って推移（+3.1%）",
+                            "テーマ該当：自動車・DX"]},
+        "technical": {"support": "3,040円（5日線）", "resistance": "3,180円（直近20日高値）",
+                      "downside": "2,964円", "holding": "5立会い日（約1週間）"},
+        "risks": ["直近高値圏で上値抵抗を意識しやすい", "日次ボラティリティ3.6%と高め"],
+        "fit": {"label": "複数条件が一致"},
+    }
+    text = sq.format_answer(evalr)
+    assert ng_words.check_ng(text) == [], ng_words.check_ng(text)
+    assert "投資助言では" in text
+    assert "7203" in text and "総合スコア" in text
+
+
+def test_query_error_answer_is_ng_clean():
+    import stock_query as sq
+    from promo import ng_words
+    text = sq.format_answer({"ok": False, "code": "9999", "error": "データ不足です。"})
+    assert ng_words.check_ng(text) == []
+    assert "9999" in text
+
+
+def test_query_answer_text_no_code():
+    import stock_query as sq
+    out = sq.answer_text("こんにちは")
+    assert "証券コード" in out
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

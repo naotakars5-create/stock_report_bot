@@ -31,6 +31,7 @@ import os
 
 DAILY_STATS = os.path.join("data", "daily_stats.csv")
 PRICE_TRACKS = os.path.join("data", "price_tracks.csv")
+SHADOW_TRACKS = os.path.join("data", "shadow_price_tracks.csv")
 
 # 統計的に「兆し」を語ってよい最低観測数と、ある程度信頼できる観測数。
 MIN_HINT = 20      # これ未満は点推定のみ・断言しない
@@ -344,6 +345,46 @@ def build_report(result):
                  "②当たり外れを全部見せる透明性、③追跡通知・銘柄Q&Aなどの対話性、へ"
                  "移すことを強く推奨します。")
     return "\n".join(L)
+
+
+def compare_live_vs_shadow(horizon="5d"):
+    """
+    balanced(本番) と defensive(シャドウ) の同期間トラックを突き合わせる（改善A）。
+
+    「守り仮説」が本当に効くか＝defensive が balanced より下方耐性・対日経で
+    優れるかを、同じ基準・同じサンプル数ゲートで正直に比較する。
+    戻り値: 比較テキスト（データ不足時はその旨）。
+    """
+    live = load_from_tracks(horizon, path=PRICE_TRACKS)
+    shadow = load_from_tracks(horizon, path=SHADOW_TRACKS)
+    if not live["strat"] and not shadow["strat"]:
+        return None
+    lines = [f"# 守り仮説A/B: balanced(本番) vs defensive(シャドウ)・期間={horizon}\n"]
+    n_live, n_shadow = len(live["strat"]), len(shadow["strat"])
+    lines.append(f"観測数: balanced={n_live} / defensive={n_shadow}")
+    if min(n_live, n_shadow) < MIN_HINT:
+        lines.append(f"\n> ⚠️ どちらかが {MIN_HINT} 期未満のため、優劣は判定できません"
+                     "（シャドウ運用を継続して蓄積してください）。点推定のみ:")
+    la = analyze(live) if live["strat"] else None
+    sa = analyze(shadow) if shadow["strat"] else None
+    for name, a in (("balanced(本番)", la), ("defensive(シャドウ)", sa)):
+        if not a:
+            continue
+        s, e = a["strat"], a["excess"]
+        lines.append(
+            f"- {name}: 累積 {_fmt(s.get('cumulative'),'%')} / "
+            f"Sortino {_fmt(s.get('sortino'))} / 最大DD {_fmt(s.get('max_dd'),'%')} / "
+            f"超過 {_fmt(e.get('mean_excess'),'pt/期',3)}（t={_fmt(e.get('t_stat'))}）")
+    if la and sa and min(n_live, n_shadow) >= MIN_HINT:
+        better_dd = (sa["strat"].get("max_dd") or -99) > (la["strat"].get("max_dd") or -99)
+        better_sortino = (sa["strat"].get("sortino") or -99) > (la["strat"].get("sortino") or -99)
+        if better_dd and better_sortino:
+            lines.append("\n**結論: defensive が下方耐性で上回る → 守り仮説を支持。"
+                         "本番採用を検討する価値あり（頑健性は継続確認）。**")
+        else:
+            lines.append("\n**結論: defensive の明確な優位は確認できず。"
+                         "現行 balanced を維持。**")
+    return "\n".join(lines)
 
 
 def run(horizon="5d"):

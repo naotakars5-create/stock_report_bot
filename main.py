@@ -200,9 +200,14 @@ def _build_tracking(today_str, today, price_map, nikkei_df, persist=True):
 
     失敗しても配信本体は止めない。戻り値: (tracking_lines, monthly_text|None)
     """
+    _hist_cache = {}
+
     def provider(code):
-        ticker = code if "." in str(code) else f"{code}.T"
-        return data_fetcher._download_history(ticker, period="3mo")
+        # live と shadow の追跡で同じ銘柄を二重取得しないようキャッシュする。
+        if code not in _hist_cache:
+            ticker = code if "." in str(code) else f"{code}.T"
+            _hist_cache[code] = data_fetcher._download_history(ticker, period="3mo")
+        return _hist_cache[code]
 
     tracking_lines, monthly_text = [], None
     try:
@@ -212,6 +217,11 @@ def _build_tracking(today_str, today, price_map, nikkei_df, persist=True):
                                                  nikkei_series=nikkei_df)
             closed = recommendation_tracker.close_expired(today_str)
             followup.record_expirations(closed, today_str=today_str)
+            # 【改善A】シャドウ(defensive)の多期間リターンも同じ基準で追跡する。
+            recommendation_tracker.update_tracks(
+                today_str, provider, nikkei_series=nikkei_df,
+                recs_path=recommendation_tracker.SHADOW_RECS_PATH,
+                tracks_path=recommendation_tracker.SHADOW_TRACKS_PATH)
 
         # 朝のイベント判定（前日終値ベース）。場中モニタと同じ二重通知ガードを共有。
         open_recs = recommendation_tracker.open_recommendations()
@@ -483,6 +493,24 @@ def main(dry_run=False):
             macro_context=macro_context, theme_ranking_out=theme_ranking,
         )
         sector_valuation.attach_sector_median(scored_stocks, sector_medians)
+
+        # 【改善A】守り仮説の検証: defensive プロファイルの上位5を「シャドウ」で算出する。
+        #   配信はせず記録・追跡だけして、balanced（本番）と成績を突き合わせる（forward A/B）。
+        #   同じ detail_histories/valuations を使うので追加のデータ取得は発生しない。
+        if not (dry_run or skip_persist):
+            try:
+                shadow_stocks = stock_scorer.score_all(
+                    detail_histories, benchmark_df=benchmark_df, top_n=FINAL_TOP_N,
+                    profiles=profiles_map, valuations=valuations,
+                    previous_codes=previous_codes, macro_context=macro_context,
+                    scoring_profile="defensive")
+                recommendation_tracker.record_today(
+                    shadow_stocks, run_date=today_str,
+                    path=recommendation_tracker.SHADOW_RECS_PATH)
+                print(f"[シャドウA/B] defensive 上位{len(shadow_stocks)}銘柄を記録"
+                      "（配信せず・成績比較用）。")
+            except Exception as e:
+                print(f"[警告] シャドウ(defensive)記録で予期せぬエラー（配信は継続）: {e}")
     else:
         print("[情報] 一次スクリーニングを通過した銘柄はありませんでした。")
     stats["final"] = len(scored_stocks)

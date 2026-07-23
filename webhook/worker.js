@@ -52,6 +52,13 @@ export default {
     if (request.method === "GET" && url.pathname === "/export") {
       return handleExport(request, env);
     }
+    // 銘柄Q&A（改善B）: バッチが未処理の問い合わせを取得／処理済みに更新する。
+    if (request.method === "GET" && url.pathname === "/queries") {
+      return handleQueriesGet(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/queries/done") {
+      return handleQueriesDone(request, env);
+    }
     return new Response("ok", { status: 200 });
   },
 };
@@ -70,6 +77,34 @@ async function handleExport(request, env) {
     users: users.results || [],
     watch_items: watch.results || [],
   });
+}
+
+// ====== 銘柄Q&A キュー（バッチ向け・Bearer認証） ======
+function _authed(request, env) {
+  return (request.headers.get("Authorization") || "") === `Bearer ${env.EXPORT_TOKEN}`;
+}
+
+async function handleQueriesGet(request, env) {
+  if (!_authed(request, env)) return new Response("unauthorized", { status: 401 });
+  const rows = await env.DB.prepare(
+    "SELECT id, user_id, code FROM query_requests WHERE status='pending' " +
+    "ORDER BY created_at LIMIT 50").all();
+  return Response.json({ queries: rows.results || [] });
+}
+
+async function handleQueriesDone(request, env) {
+  if (!_authed(request, env)) return new Response("unauthorized", { status: 401 });
+  let body = {};
+  try { body = await request.json(); } catch (_e) { /* ignore */ }
+  const ids = Array.isArray(body.ids) ? body.ids : [];
+  const status = body.status === "error" ? "error" : "done";
+  const now = new Date().toISOString();
+  for (const id of ids) {
+    await env.DB.prepare(
+      "UPDATE query_requests SET status=?, answered_at=? WHERE id=?"
+    ).bind(status, now, id).run();
+  }
+  return Response.json({ updated: ids.length });
 }
 
 // ====== /webhook（LINE 署名検証 → イベント処理） ======
@@ -134,7 +169,7 @@ async function handleEvent(ev, env) {
   if (ev.type === "message" && ev.message?.type === "text") {
     // テキストコマンド: 「保有 1234」「保有解除 1234」（証券コード4〜5桁）
     const text = (ev.message.text || "").trim();
-    let m = text.match(/^保有[  ]*([0-9]{4}[0-9A-Z]?)$/);
+    let m = text.match(/^保有[  ]*([0-9]{3}[0-9A-Z])$/);
     if (m) {
       await addWatch(userId, m[1], "holding", env, now);
       await reply(ev.replyToken, env,
@@ -142,12 +177,26 @@ async function handleEvent(ev, env) {
         `解除は「保有解除 ${m[1]}」と送信してください。${DISCLAIMER}`);
       return;
     }
-    m = text.match(/^保有解除[  ]*([0-9]{4}[0-9A-Z]?)$/);
+    m = text.match(/^保有解除[  ]*([0-9]{3}[0-9A-Z])$/);
     if (m) {
       await env.DB.prepare(
         "DELETE FROM watch_items WHERE user_id=? AND code=? AND kind='holding'"
       ).bind(userId, m[1]).run();
       await reply(ev.replyToken, env, `保有銘柄（${m[1]}）の登録を解除しました。`);
+      return;
+    }
+    // 銘柄Q&A（改善B）: 「評価 1234」または単独の4桁コードを問い合わせとして受ける。
+    // Worker は株価取得・スコアリングができない（Python必須）ため、D1にキューして
+    // バッチが回答を push する。ここでは受付だけを即時 reply で返す（課金対象外）。
+    m = text.match(/^(?:評価|査定)?[  ]*([0-9]{3}[0-9A-Z])$/);
+    if (m) {
+      await env.DB.prepare(
+        `INSERT INTO query_requests (user_id, code, status, created_at)
+         VALUES (?, ?, 'pending', ?)`
+      ).bind(userId, m[1], now).run();
+      await reply(ev.replyToken, env,
+        `銘柄（${m[1]}）の評価リクエストを受け付けました。` +
+        `次の処理タイミングで機械的な評価をお送りします。${DISCLAIMER}`);
       return;
     }
   }

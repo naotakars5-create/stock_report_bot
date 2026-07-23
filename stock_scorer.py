@@ -220,7 +220,8 @@ def _size_from_mktcap(valuation):
 
 # ====== 二次スクリーニング（評価点 0〜10） ======
 def score_stock(history, benchmark_close=None, theme_tags=None,
-                valuation=None, continuity=None, news_ratio=None, news_line=None):
+                valuation=None, continuity=None, news_ratio=None, news_line=None,
+                profile=None, sector=None):
     """
     1銘柄を 8つの評価軸でスコアリングする。
 
@@ -232,10 +233,15 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
         continuity: {"in_previous": bool}（前回上位かどうか。None で中立）
         news_ratio: ニュース環境評価(0〜1)。None で中立(0.5)
         news_line: ニュース環境の説明文（評価理由・カード表示に使う）
+        profile: スコアリングプロファイル（scoring_profiles）。None で balanced＝現行と同一。
+        sector: 業種名（defensive プロファイルの業種加点に使用）
 
     戻り値: dict（score/price/reasons/risks/details/metrics 等）。計算不可なら None。
     注意: これは売買推奨ではなく、機械的なスクリーニング評価です。
     """
+    import scoring_profiles
+    prof = scoring_profiles.get_profile(profile)
+    w = prof["weights"]
     close = history["Close"].dropna()
     volume = history["Volume"].dropna() if "Volume" in history else pd.Series(dtype=float)
     if len(close) < 75:
@@ -252,7 +258,7 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
     # 1. トレンド評価
     checks = [price > sma25, price > sma5, sma5 > sma25, sma25 > sma75, price > sma75]
     trend_ratio = sum(1 for c in checks if c) / len(checks)
-    details["トレンド"] = trend_ratio * WEIGHTS["トレンド"]
+    details["トレンド"] = trend_ratio * w["トレンド"]
     gap_5_25 = (sma5 - sma25) / sma25 * 100 if sma25 else 0.0
     gap_25_75 = (sma25 - sma75) / sma75 * 100 if sma75 else 0.0
     if sma5 > sma25 > sma75 and price > sma5:
@@ -279,7 +285,7 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
             liq = 0.5
         elif turnover < 5e8:
             liq = 0.8
-    details["出来高"] = base_vol * liq * WEIGHTS["出来高"]
+    details["出来高"] = base_vol * liq * w["出来高"]
     if vol_ratio is not None and vol_ratio > 1.2:
         reasons.append(f"直近出来高が20日平均比{vol_ratio:.2f}倍に増加")
     if turnover is not None and turnover < 1e8:
@@ -295,37 +301,43 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
         if b20 is not None:
             rel = stock_20 - b20
     if rel is not None:
-        details["相対強度"] = _clamp((rel + 5) / 10) * WEIGHTS["相対強度"]
+        details["相対強度"] = _clamp((rel + 5) / 10) * w["相対強度"]
         if rel > 0:
             reasons.append(f"市場平均(TOPIX)を20日で{rel:.1f}pt上回る相対的な強さ")
         else:
             risks.append(f"市場平均(TOPIX)を20日で{abs(rel):.1f}pt下回る")
     else:
-        details["相対強度"] = 0.5 * WEIGHTS["相対強度"]
+        details["相対強度"] = 0.5 * w["相対強度"]
 
     # 4. 業種テーマ性評価
     n = len(theme_tags)
     base_theme = 0.3 + 0.25 * n
     if any(t in HIGH_ATTENTION_THEMES for t in theme_tags):
         base_theme += 0.15
-    details["テーマ性"] = _clamp(base_theme) * WEIGHTS["テーマ性"]
+    details["テーマ性"] = _clamp(base_theme) * w["テーマ性"]
     if theme_tags:
         reasons.append("テーマ性: " + "・".join(theme_tags[:3]))
 
     # 5. ニュース環境・マクロテーマ評価（世界情勢・経済ニュースとの関連。中立は0.5）
     #    詳しい関連理由・注意点・解説は report_writer 側で macro_reason 等から生成する。
     nr = 0.5 if news_ratio is None else _clamp(news_ratio)
-    details["ニュース"] = nr * WEIGHTS["ニュース"]
+    details["ニュース"] = nr * w["ニュース"]
 
     # 6. バリュエーション評価（取得不可は中立）
-    details["割安感"] = _valuation_ratio(valuation) * WEIGHTS["割安感"]
+    details["割安感"] = _valuation_ratio(valuation) * w["割安感"]
 
-    # 7. 安定性・過熱回避
+    # 7. 安定性・過熱回避（プロファイルで過熱・高ボラの厳しさとディフェンシブ加点を可変）
     surge_5 = _pct_change(close, 5)
     vol_pct = _daily_volatility(close, 20)
-    oh = 0.5 if surge_5 is None else (1.0 if surge_5 <= 0 else _clamp(1 - surge_5 / 15))
-    stab = 0.5 if vol_pct is None else _clamp((4 - vol_pct) / 3)
-    details["安定性"] = (oh + stab) / 2 * WEIGHTS["安定性"]
+    surge_div = prof.get("surge_div", 15.0)
+    vol_hi = prof.get("vol_hi", 4.0)
+    oh = 0.5 if surge_5 is None else (1.0 if surge_5 <= 0 else _clamp(1 - surge_5 / surge_div))
+    stab = 0.5 if vol_pct is None else _clamp((vol_hi - vol_pct) / 3)
+    base_stab = (oh + stab) / 2
+    # ディフェンシブ業種への加点（balanced は対象業種が空＝加点なし＝現行と同一）
+    if sector and sector in (prof.get("defensive_sectors") or set()):
+        base_stab = _clamp(base_stab + prof.get("defensive_bonus", 0.0))
+    details["安定性"] = base_stab * w["安定性"]
     if surge_5 is not None and surge_5 >= 12:
         risks.append(f"直近5日で{surge_5:.1f}%上昇しており短期的な過熱感に注意")
     if vol_pct is not None and vol_pct >= 3.5:
@@ -338,10 +350,10 @@ def score_stock(history, benchmark_close=None, theme_tags=None,
 
     # 8. 前回検証・継続性補正
     if continuity is None or not continuity.get("in_previous"):
-        details["継続性"] = 0.5 * WEIGHTS["継続性"]
+        details["継続性"] = 0.5 * w["継続性"]
     else:
         cont_ratio = 0.4 if (surge_5 is not None and surge_5 >= 12) else 0.85
-        details["継続性"] = cont_ratio * WEIGHTS["継続性"]
+        details["継続性"] = cont_ratio * w["継続性"]
         reasons.append("前回も上位で条件の継続性あり")
 
     raw = sum(details.values())
@@ -422,7 +434,7 @@ def compute_theme_ranking(scored, top_themes=6, per_theme=3):
 
 def score_all(stock_histories, benchmark_df=None, top_n=5, profiles=None,
               valuations=None, previous_codes=None, macro_context=None,
-              theme_ranking_out=None):
+              theme_ranking_out=None, scoring_profile=None):
     """
     全候補銘柄をスコアリングし、評価点 MIN_FINAL_SCORE 以上の上位 top_n 件を返す。
 
@@ -431,6 +443,8 @@ def score_all(stock_histories, benchmark_df=None, top_n=5, profiles=None,
         valuations: {code: valuation}（data_fetcher.get_valuation の結果）
         previous_codes: 前回上位の証券コード集合（継続性補正に使用）
         macro_context: macro_analyzer.analyze の結果（ニュース環境評価に使用。None で中立）
+        scoring_profile: スコアリングプロファイル名/定義（balanced/defensive）。
+            None で balanced（現行と同一）。defensive はシャドウA/B検証用。
     """
     benchmark_close = None
     if benchmark_df is not None and "Close" in benchmark_df:
@@ -466,6 +480,8 @@ def score_all(stock_histories, benchmark_df=None, top_n=5, profiles=None,
             continuity={"in_previous": code in previous_codes},
             news_ratio=news_ratio,
             news_line=news_line,
+            profile=scoring_profile,
+            sector=sector,
         )
         if result is None:
             print(f"[警告] スコア計算をスキップ: {item['name']} ({code})")

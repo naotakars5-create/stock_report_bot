@@ -21,3 +21,16 @@ CREATE TABLE IF NOT EXISTS watch_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_watch_code ON watch_items (code);
+
+-- 銘柄Q&A（改善B）: 読者からの問い合わせキュー。
+-- Worker が pending で積み、バッチ(query_worker.py)が処理して status を done に更新。
+CREATE TABLE IF NOT EXISTS query_requests (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    TEXT NOT NULL,
+  code       TEXT NOT NULL,             -- 問い合わせ証券コード
+  status     TEXT NOT NULL DEFAULT 'pending', -- pending / done / error
+  created_at TEXT NOT NULL,
+  answered_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_query_status ON query_requests (status);

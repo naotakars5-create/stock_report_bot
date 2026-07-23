@@ -38,6 +38,10 @@ import performance
 
 RECS_PATH = os.path.join("data", "recommendations.csv")
 TRACKS_PATH = os.path.join("data", "price_tracks.csv")
+# シャドウA/B（改善A: 守り仮説の検証）。defensive プロファイルの上位5を配信せず
+# 記録・追跡だけして、balanced（本番配信）と成績を突き合わせる。
+SHADOW_RECS_PATH = os.path.join("data", "shadow_recommendations.csv")
+SHADOW_TRACKS_PATH = os.path.join("data", "shadow_price_tracks.csv")
 
 REC_FIELDS = ["run_date", "code", "name", "rank", "score", "entry_price",
               "basis_conditions", "basis_count", "basis_total",
