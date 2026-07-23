@@ -24,10 +24,20 @@ LINE配信は「カード中心」の構成です:
 """
 
 import re
-from datetime import datetime
 
 import macro_analyzer
+import market_calendar
 import stock_insights as si
+
+
+def _now_str():
+    """配信時刻表示は必ず日本時間(JST)で出す。
+
+    GitHub Actions のランナーは UTC で動くため、素の datetime.now() を使うと
+    レポートの「配信 HH:MM」が JST より約9時間ずれ（日付も前日にずれ）てしまう。
+    market_calendar.now_jst() は JST を返し、SIMULATE_DATE も尊重する。
+    """
+    return market_calendar.now_jst().strftime("%Y/%m/%d %H:%M")
 from stock_scorer import WEIGHTS
 
 
@@ -811,7 +821,7 @@ def build_followup_text(market, scored_stocks, stats=None, validations=None,
     含めるのは: 冒頭免責／今日のニュース・マクロ環境／今日強いテーマ／
     テーマ別確認銘柄／累積成績／検証結果／末尾免責。
     """
-    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = now_str or _now_str()
     head2 = basis_label or f"{SUBTITLE} ・ {now_str}"
     parts = ["【補足レポート（深掘り）】", head2, "",
              "⚠️ " + STRONG_DISCLAIMER_HEAD, "",
@@ -834,7 +844,7 @@ def build_fallback_text(market, scored_stocks, stats=None, validations=None,
     カードが届かないため、上位銘柄を1行ずつ（名称・コード・評価点・テーマ）だけ補い、
     続けて補足テキスト本文を載せる。長文にはせず、最大1500字に収める。
     """
-    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = now_str or _now_str()
     head2 = basis_label or f"{SUBTITLE} ・ {now_str}"
     parts = [f"【{TITLE}】（カード表示の代替・短縮版）", head2, "",
              "⚠️ " + STRONG_DISCLAIMER_HEAD, ""]
@@ -866,7 +876,7 @@ def build_report(market, scored_stocks, stats=None, validations=None,
     ＋短い補足テキスト build_followup_text()）で構成し、銘柄詳細はカードに集約する。
     この関数はターミナルでの確認用、および将来の別チャネル（Web/PDF）向けに残している。
     """
-    now = datetime.now().strftime("%Y/%m/%d %H:%M")
+    now = _now_str()
     parts = [f"【{TITLE}】", SUBTITLE, basis_label or "", f"配信 {now}", "", DESCRIPTION, ""]
 
     parts.append("■ 今日の市場概況")
@@ -967,7 +977,7 @@ def build_flex_message(market, scored_stocks, stats=None, validations=None,
     マクロ環境の文章・テーマの詳細・関連テーマ一覧・今日強いテーマは補足レポート(3通目)へ移動。
     basis_label には「データ基準日：M月D日 大引け時点」を渡す（データ鮮度の明示）。
     """
-    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = now_str or _now_str()
     judgment = si.market_judgment(market, stats)
     temp = si.daily_temperature(scored_stocks, market, stats, judgment)
 
@@ -1338,7 +1348,7 @@ def build_stock_cards(scored_stocks, macro_context=None, now_str=None):
     """
     if not scored_stocks:
         return None
-    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = now_str or _now_str()
     bubbles = [_stock_bubble(i, s, macro_context) for i, s in enumerate(scored_stocks, start=1)]
     carousel = {"type": "carousel", "contents": bubbles}
 

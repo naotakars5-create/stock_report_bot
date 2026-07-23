@@ -23,6 +23,13 @@ stock_insights.py
 
 from datetime import date, datetime
 
+import market_calendar
+
+
+def _today_jst():
+    """イベントまでの残日数は JST 基準で数える（Actions は UTC 稼働のため）。"""
+    return market_calendar.today_jst()
+
 
 # ====== 表示補助 ======
 def stars(n, total=5):
@@ -288,7 +295,7 @@ def earnings_view(s, calendar=None, today=None):
 
     戻り値: {"date_line": str, "beat_line": str, "soon": bool}
     """
-    today = today or datetime.now().date()
+    today = today or _today_jst()
     cal = calendar or {}
     ed = cal.get("earnings_date")
     du = _days_until(ed, today)
@@ -316,7 +323,7 @@ def event_view(s, calendar=None, today=None, horizon_days=14):
 
     戻り値: {"items": [str, ...], "has_event": bool}
     """
-    today = today or datetime.now().date()
+    today = today or _today_jst()
     cal = calendar or {}
     items = []
     xd = cal.get("ex_dividend_date")
