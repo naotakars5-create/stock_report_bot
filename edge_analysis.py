@@ -31,7 +31,11 @@ import os
 
 DAILY_STATS = os.path.join("data", "daily_stats.csv")
 PRICE_TRACKS = os.path.join("data", "price_tracks.csv")
-SHADOW_TRACKS = os.path.join("data", "shadow_price_tracks.csv")
+# シャドウアーム（配信しない検証アーム）のトラックCSV。
+SHADOW_ARMS = {
+    "defensive": os.path.join("data", "shadow_defensive_tracks.csv"),
+    "catalyst": os.path.join("data", "shadow_catalyst_tracks.csv"),
+}
 
 # 統計的に「兆し」を語ってよい最低観測数と、ある程度信頼できる観測数。
 MIN_HINT = 20      # これ未満は点推定のみ・断言しない
@@ -347,44 +351,58 @@ def build_report(result):
     return "\n".join(L)
 
 
-def compare_live_vs_shadow(horizon="5d"):
+def compare_arms(horizon="5d"):
     """
-    balanced(本番) と defensive(シャドウ) の同期間トラックを突き合わせる（改善A）。
+    balanced(本番) と各シャドウアーム(defensive/catalyst)を同基準で突き合わせる。
 
-    「守り仮説」が本当に効くか＝defensive が balanced より下方耐性・対日経で
-    優れるかを、同じ基準・同じサンプル数ゲートで正直に比較する。
-    戻り値: 比較テキスト（データ不足時はその旨）。
+    どのアームが下方耐性・対日経で優れるかを、サンプル数ゲート付きで正直に比較する。
+    戻り値: 比較テキスト（データが全く無ければ None）。
     """
-    live = load_from_tracks(horizon, path=PRICE_TRACKS)
-    shadow = load_from_tracks(horizon, path=SHADOW_TRACKS)
-    if not live["strat"] and not shadow["strat"]:
+    arms = [("balanced(本番)", load_from_tracks(horizon, path=PRICE_TRACKS))]
+    for name, path in SHADOW_ARMS.items():
+        arms.append((f"{name}(シャドウ)", load_from_tracks(horizon, path=path)))
+    arms = [(nm, sr) for nm, sr in arms if sr["strat"]]
+    if not arms:
         return None
-    lines = [f"# 守り仮説A/B: balanced(本番) vs defensive(シャドウ)・期間={horizon}\n"]
-    n_live, n_shadow = len(live["strat"]), len(shadow["strat"])
-    lines.append(f"観測数: balanced={n_live} / defensive={n_shadow}")
-    if min(n_live, n_shadow) < MIN_HINT:
-        lines.append(f"\n> ⚠️ どちらかが {MIN_HINT} 期未満のため、優劣は判定できません"
-                     "（シャドウ運用を継続して蓄積してください）。点推定のみ:")
-    la = analyze(live) if live["strat"] else None
-    sa = analyze(shadow) if shadow["strat"] else None
-    for name, a in (("balanced(本番)", la), ("defensive(シャドウ)", sa)):
-        if not a:
-            continue
+
+    lines = [f"# アームA/B比較（期間={horizon}）\n"]
+    lines.append("観測数: " + " / ".join(f"{nm.split('(')[0]}={len(sr['strat'])}"
+                                         for nm, sr in arms))
+    n_min = min(len(sr["strat"]) for _nm, sr in arms)
+    if n_min < MIN_HINT:
+        lines.append(f"\n> ⚠️ 最小観測が {n_min} 期（{MIN_HINT}期未満）のため優劣は"
+                     "判定できません。点推定のみ（シャドウ運用を継続して蓄積）:")
+
+    analyzed = []
+    for nm, sr in arms:
+        a = analyze(sr)
+        analyzed.append((nm, a))
         s, e = a["strat"], a["excess"]
         lines.append(
-            f"- {name}: 累積 {_fmt(s.get('cumulative'),'%')} / "
+            f"- {nm}: 累積 {_fmt(s.get('cumulative'),'%')} / "
             f"Sortino {_fmt(s.get('sortino'))} / 最大DD {_fmt(s.get('max_dd'),'%')} / "
             f"超過 {_fmt(e.get('mean_excess'),'pt/期',3)}（t={_fmt(e.get('t_stat'))}）")
-    if la and sa and min(n_live, n_shadow) >= MIN_HINT:
-        better_dd = (sa["strat"].get("max_dd") or -99) > (la["strat"].get("max_dd") or -99)
-        better_sortino = (sa["strat"].get("sortino") or -99) > (la["strat"].get("sortino") or -99)
-        if better_dd and better_sortino:
-            lines.append("\n**結論: defensive が下方耐性で上回る → 守り仮説を支持。"
-                         "本番採用を検討する価値あり（頑健性は継続確認）。**")
-        else:
-            lines.append("\n**結論: defensive の明確な優位は確認できず。"
-                         "現行 balanced を維持。**")
+
+    if n_min >= MIN_HINT and len(analyzed) >= 2:
+        # 下方リスク調整(Sortino)が最も高いアームを勝者候補に
+        best = max(analyzed, key=lambda x: (x[1]["strat"].get("sortino") or -99))
+        base = next((a for nm, a in analyzed if nm.startswith("balanced")), None)
+        if base and best[0].startswith("balanced"):
+            lines.append("\n**結論: 本番(balanced)を上回るアームは無し。現行維持。**")
+        elif base:
+            b_sortino = best[1]["strat"].get("sortino") or -99
+            base_sortino = base["strat"].get("sortino") or -99
+            if b_sortino > base_sortino:
+                lines.append(f"\n**結論: {best[0]} が下方リスク調整で本番を上回る → "
+                             "本番採用を検討（頑健性・レジーム横断を継続確認）。**")
+            else:
+                lines.append("\n**結論: シャドウの明確な優位は確認できず。現行維持。**")
     return "\n".join(lines)
+
+
+# 後方互換のエイリアス（旧名）。
+def compare_live_vs_shadow(horizon="5d"):
+    return compare_arms(horizon)
 
 
 def run(horizon="5d"):

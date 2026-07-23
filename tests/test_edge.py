@@ -141,6 +141,77 @@ def test_query_answer_text_no_code():
     assert "証券コード" in out
 
 
+# ====== 改善②: catalyst（決算跨ぎ回避＋PEAD近似） ======
+def _cat_stock(code, surge=None, vr=None, score=7.0):
+    return {"code": code, "name": f"銘柄{code}", "score": score,
+            "metrics": {"surge_5": surge, "vol_ratio": vr}}
+
+
+def test_catalyst_penalizes_earnings_cross():
+    import catalyst
+    from datetime import date
+    today = date(2026, 7, 22)
+    cal = {"earnings_date": date(2026, 7, 27)}  # 5日後＝保有期間内
+    d, notes = catalyst.catalyst_adjustment(_cat_stock("1000"), cal, today)
+    assert d < 0 and any("保有期間内に決算" in n for n in notes)
+
+
+def test_catalyst_bonus_pead():
+    import catalyst
+    from datetime import date
+    today = date(2026, 7, 22)
+    cal = {"earnings_date": date(2026, 7, 15)}  # 7日前＝直近決算通過
+    d, notes = catalyst.catalyst_adjustment(
+        _cat_stock("1000", surge=3.0, vr=1.4), cal, today)
+    assert d > 0 and any("ドリフト" in n for n in notes)
+
+
+def test_catalyst_fade_penalty():
+    import catalyst
+    from datetime import date
+    today = date(2026, 7, 22)
+    cal = {"earnings_date": date(2026, 7, 15)}
+    d, _n = catalyst.catalyst_adjustment(
+        _cat_stock("1000", surge=-5.0, vr=1.0), cal, today)
+    assert d < 0
+
+
+def test_catalyst_no_calendar_is_neutral():
+    import catalyst
+    from datetime import date
+    d, notes = catalyst.catalyst_adjustment(_cat_stock("1000", surge=2, vr=1.3),
+                                            {}, date(2026, 7, 22))
+    assert d == 0.0 and notes == []
+
+
+def test_catalyst_rerank_promotes_and_demotes():
+    import catalyst
+    from datetime import date
+    today = date(2026, 7, 22)
+    cands = [
+        _cat_stock("A", score=7.5),                 # 決算跨ぎ → 減点
+        _cat_stock("B", surge=3.0, vr=1.4, score=7.0),  # PEAD → 加点
+        _cat_stock("C", score=7.2),                 # 中立
+    ]
+    cals = {"A": {"earnings_date": date(2026, 7, 24)},
+            "B": {"earnings_date": date(2026, 7, 15)},
+            "C": {}}
+    ranked = catalyst.rerank(cands, cals, today=today, top_n=3)
+    # B(7.0+0.8=7.8)がA(7.5-1.0=6.5)より上位に来る
+    assert ranked[0]["code"] == "B"
+    codes = [r["code"] for r in ranked]
+    assert codes.index("B") < codes.index("A")
+    assert all("catalyst_delta" in r for r in ranked)
+
+
+def test_shadow_paths_distinct():
+    import recommendation_tracker as rt
+    dr, dt = rt.shadow_paths("defensive")
+    cr, ct = rt.shadow_paths("catalyst")
+    assert dr != cr and dt != ct
+    assert "defensive" in dr and "catalyst" in cr
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

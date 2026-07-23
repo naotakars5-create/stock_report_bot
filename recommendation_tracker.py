@@ -38,10 +38,16 @@ import performance
 
 RECS_PATH = os.path.join("data", "recommendations.csv")
 TRACKS_PATH = os.path.join("data", "price_tracks.csv")
-# シャドウA/B（改善A: 守り仮説の検証）。defensive プロファイルの上位5を配信せず
-# 記録・追跡だけして、balanced（本番配信）と成績を突き合わせる。
-SHADOW_RECS_PATH = os.path.join("data", "shadow_recommendations.csv")
-SHADOW_TRACKS_PATH = os.path.join("data", "shadow_price_tracks.csv")
+# シャドウA/B（改善A/②）: 配信しないアーム（defensive・catalyst 等）の上位5を
+# 記録・追跡だけして、balanced（本番配信）と成績を突き合わせる。アームは名前で分ける。
+def shadow_paths(arm):
+    """シャドウアーム名 → (推奨CSV, トラックCSV) のパス。"""
+    return (os.path.join("data", f"shadow_{arm}_recommendations.csv"),
+            os.path.join("data", f"shadow_{arm}_tracks.csv"))
+
+
+# 後方互換（defensive アーム）のエイリアス。
+SHADOW_RECS_PATH, SHADOW_TRACKS_PATH = shadow_paths("defensive")
 
 REC_FIELDS = ["run_date", "code", "name", "rank", "score", "entry_price",
               "basis_conditions", "basis_count", "basis_total",

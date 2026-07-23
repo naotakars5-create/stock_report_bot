@@ -50,6 +50,7 @@ import followup
 import subscriber_store
 import personalize
 import sector_valuation
+import catalyst
 
 
 def _int_env(name, default):
@@ -217,11 +218,12 @@ def _build_tracking(today_str, today, price_map, nikkei_df, persist=True):
                                                  nikkei_series=nikkei_df)
             closed = recommendation_tracker.close_expired(today_str)
             followup.record_expirations(closed, today_str=today_str)
-            # 【改善A】シャドウ(defensive)の多期間リターンも同じ基準で追跡する。
-            recommendation_tracker.update_tracks(
-                today_str, provider, nikkei_series=nikkei_df,
-                recs_path=recommendation_tracker.SHADOW_RECS_PATH,
-                tracks_path=recommendation_tracker.SHADOW_TRACKS_PATH)
+            # 【改善A/②】各シャドウアーム(defensive/catalyst)の多期間リターンも同基準で追跡。
+            for arm in ("defensive", "catalyst"):
+                arm_recs, arm_tracks = recommendation_tracker.shadow_paths(arm)
+                recommendation_tracker.update_tracks(
+                    today_str, provider, nikkei_series=nikkei_df,
+                    recs_path=arm_recs, tracks_path=arm_tracks)
 
         # 朝のイベント判定（前日終値ベース）。場中モニタと同じ二重通知ガードを共有。
         open_recs = recommendation_tracker.open_recommendations()
@@ -494,23 +496,45 @@ def main(dry_run=False):
         )
         sector_valuation.attach_sector_median(scored_stocks, sector_medians)
 
-        # 【改善A】守り仮説の検証: defensive プロファイルの上位5を「シャドウ」で算出する。
-        #   配信はせず記録・追跡だけして、balanced（本番）と成績を突き合わせる（forward A/B）。
-        #   同じ detail_histories/valuations を使うので追加のデータ取得は発生しない。
+        # 【改善A/②】守り仮説・カタリスト仮説の検証: 配信しない2つのアームの上位5を
+        #   「シャドウ」で算出・記録し、balanced（本番）と成績を突き合わせる（forward A/B）。
+        #   本番配信(scored_stocks)は一切変えない。
         if not (dry_run or skip_persist):
+            # defensive（守り）: 同じ detail_histories を使うので追加取得なし。
             try:
-                shadow_stocks = stock_scorer.score_all(
+                shadow_def = stock_scorer.score_all(
                     detail_histories, benchmark_df=benchmark_df, top_n=FINAL_TOP_N,
                     profiles=profiles_map, valuations=valuations,
                     previous_codes=previous_codes, macro_context=macro_context,
                     scoring_profile="defensive")
                 recommendation_tracker.record_today(
-                    shadow_stocks, run_date=today_str,
-                    path=recommendation_tracker.SHADOW_RECS_PATH)
-                print(f"[シャドウA/B] defensive 上位{len(shadow_stocks)}銘柄を記録"
-                      "（配信せず・成績比較用）。")
+                    shadow_def, run_date=today_str,
+                    path=recommendation_tracker.shadow_paths("defensive")[0])
+                print(f"[シャドウ] defensive 上位{len(shadow_def)}銘柄を記録（配信せず）。")
             except Exception as e:
-                print(f"[警告] シャドウ(defensive)記録で予期せぬエラー（配信は継続）: {e}")
+                print(f"[警告] シャドウ(defensive)記録で例外（配信は継続）: {e}")
+            # catalyst（イベント連動）: balanced候補プール(最大15)の決算日を取得し、
+            #   決算跨ぎ回避＋決算後ドリフト近似で並べ替えて上位5を記録する。
+            try:
+                pool = stock_scorer.score_all(
+                    detail_histories, benchmark_df=benchmark_df, top_n=15,
+                    profiles=profiles_map, valuations=valuations,
+                    previous_codes=previous_codes, macro_context=macro_context)
+                cals = {}
+                for s in pool:
+                    code = s.get("code", "")
+                    tk = code if "." in code else f"{code}.T"
+                    try:
+                        cals[code] = data_fetcher.get_calendar_events(tk)
+                    except Exception:
+                        cals[code] = {}
+                shadow_cat = catalyst.rerank(pool, cals, today=today, top_n=FINAL_TOP_N)
+                recommendation_tracker.record_today(
+                    shadow_cat, run_date=today_str,
+                    path=recommendation_tracker.shadow_paths("catalyst")[0])
+                print(f"[シャドウ] catalyst 上位{len(shadow_cat)}銘柄を記録（配信せず）。")
+            except Exception as e:
+                print(f"[警告] シャドウ(catalyst)記録で例外（配信は継続）: {e}")
     else:
         print("[情報] 一次スクリーニングを通過した銘柄はありませんでした。")
     stats["final"] = len(scored_stocks)
