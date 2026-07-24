@@ -24,10 +24,20 @@ LINE配信は「カード中心」の構成です:
 """
 
 import re
-from datetime import datetime
 
 import macro_analyzer
+import market_calendar
 import stock_insights as si
+
+
+def _now_str():
+    """配信時刻表示は必ず日本時間(JST)で出す。
+
+    GitHub Actions のランナーは UTC で動くため、素の datetime.now() を使うと
+    レポートの「配信 HH:MM」が JST より約9時間ずれ（日付も前日にずれ）てしまう。
+    market_calendar.now_jst() は JST を返し、SIMULATE_DATE も尊重する。
+    """
+    return market_calendar.now_jst().strftime("%Y/%m/%d %H:%M")
 from stock_scorer import WEIGHTS
 
 
@@ -41,6 +51,20 @@ DISCLAIMER = (
     "本レポートは、公開データをもとにした機械的なスクリーニング結果であり、"
     "特定銘柄の売買を推奨するものではありません。"
     "投資判断は必ずご自身の責任で行ってください。"
+)
+
+# 機能2: 各配信の冒頭・末尾に入れる「強めの免責」。売買目安を機械的参考値として
+# 明記し、投資助言でない旨・自己責任である旨を明確にする（NG語は使わない）。
+STRONG_DISCLAIMER_HEAD = (
+    "本配信は公開データからの機械的なスクリーニング結果であり、投資助言では"
+    "ありません。記載の価格・保有期間などの目安は、スクリーニング条件から"
+    "機械的に算出した参考値です。最終的な投資判断は必ずご自身の責任で行って"
+    "ください。"
+)
+STRONG_DISCLAIMER_TAIL = (
+    "本配信は特定銘柄の売買を推奨するものではありません。掲載の価格・期間の目安は"
+    "機械的に算出した参考値であり、将来の価格や成果を保証しません。相場変動により"
+    "損失が生じる可能性があります。投資は必ずご自身の判断と責任で行ってください。"
 )
 
 # 評価バランス図に出す軸（継続性補正は図には出さない）と、桁を揃えるためのラベル
@@ -599,8 +623,14 @@ def _clip_text(text, limit):
 
 
 def _followup_macro_bullets(market, scored_stocks, stats, macro_context):
-    """補足テキスト用のマクロ環境（2〜4行）。重複（部分一致含む）を避け、短い文だけを採る。"""
+    """補足テキスト用のマクロ環境（2〜4行）。重複（部分一致含む）を避け、短い文だけを採る。
+
+    機能3: 前日と酷似／数値変化なしの項目（macro_context["_freshness"] の stale）は
+    「使い回し」とみなして落とし、その日ならではの項目だけを載せる。
+    """
+    import macro_state
     mc = macro_context or {}
+    fresh = mc.get("_freshness")
     bullets = []
 
     def _add(v):
@@ -614,13 +644,157 @@ def _followup_macro_bullets(market, scored_stocks, stats, macro_context):
                 return
         bullets.append(v)
 
-    _add(mc.get("market_summary"))
+    if macro_state.is_fresh(fresh, "market_summary"):
+        _add(mc.get("market_summary"))
     for key in ("us_market_comment", "fx_comment", "commodity_comment",
                 "geopolitical_comment"):
-        _add(mc.get(key))
+        if macro_state.is_fresh(fresh, key):
+            _add(mc.get(key))
     if not bullets:
+        # 鮮度チェックで全て落ちた（＝前日から新味が薄い）場合も、無理に使い回さず
+        # トレンド要約で「その日の数値」に基づく1行だけを出す。
         _add(analyze_trend(market, scored_stocks, stats)["headline"] + "。")
     return bullets[:4]
+
+
+def _performance_card_lines(performance):
+    """サマリーカード用の累積成績（3〜4行・機能4）。集計前は蓄積中を明示。"""
+    p = performance or {}
+    if not p.get("available"):
+        return ["累積成績は集計中です（5立会い日保有・週次非重複で蓄積）。",
+                "勝った月も負けた月も、一貫した基準で開示します。"]
+    lines = []
+    vs = p.get("cum_vs_nikkei")
+    vs_txt = f"（vs日経 {vs:+.1f}pt）" if vs is not None else ""
+    lines.append(f"累積リターン {p['cum_return']:+.1f}%{vs_txt}")
+    cwr = p.get("cohort_win_rate")
+    pwr = p.get("pick_win_rate")
+    wr = f"コホート勝率 {cwr:.0f}%" if cwr is not None else ""
+    if pwr is not None:
+        wr += f" / 銘柄勝率 {pwr:.0f}%"
+    lines.append(f"{wr}（{p.get('chain_cohorts', 0)}コホート）")
+    if p.get("max_drawdown") is not None:
+        lines.append(f"最大ドローダウン {p['max_drawdown']:.1f}%")
+    monthly = p.get("monthly") or []
+    if monthly:
+        m = monthly[-1]
+        mvs = m.get("cum_vs_nikkei")
+        mvs_txt = f"・vs日経 {mvs:+.1f}pt" if mvs is not None else ""
+        lines.append(f"直近月 {m['month']}: 月次 {m['month_return']:+.1f}%"
+                     f"（累積 {m['cum_return']:+.1f}%{mvs_txt}）")
+    lines.append("基準: 5立会い日保有・等加重・週次非重複の複利連鎖（一貫集計）")
+    return lines
+
+
+def _performance_followup_lines(performance):
+    """補足レポート用の累積成績（月次テーブル込み・機能4）。"""
+    p = performance or {}
+    lines = ["■ 累積成績（スクリーニング上位群 vs 日経平均）"]
+    if not p.get("available"):
+        lines.append("（集計中です。5立会い日保有・週次非重複・等加重の複利連鎖で"
+                     "累積リターン／勝率／最大ドローダウンを一貫基準で蓄積します。）")
+        return lines
+    vs = p.get("cum_vs_nikkei")
+    lines.append(f"・累積リターン：{p['cum_return']:+.2f}%"
+                 + (f"（日経平均 {p['cum_nikkei']:+.2f}% / 差 {vs:+.2f}pt）"
+                    if vs is not None else ""))
+    cwr, pwr = p.get("cohort_win_rate"), p.get("pick_win_rate")
+    if cwr is not None:
+        lines.append(f"・勝率：コホート {cwr:.1f}%"
+                     + (f" / 銘柄ベース {pwr:.1f}%" if pwr is not None else "")
+                     + f"（{p.get('chain_cohorts', 0)}コホート・{p.get('pick_count', 0)}銘柄）")
+    if p.get("max_drawdown") is not None:
+        lines.append(f"・最大ドローダウン：{p['max_drawdown']:.2f}%")
+    lines.append("・集計基準：抽出日終値を起点に5立会い日後終値で確定。等加重・"
+                 "週次非重複コホートの複利連鎖（期間の取り方で良く見せる操作はしません）。")
+    monthly = p.get("monthly") or []
+    if monthly:
+        lines.append("")
+        lines.append("【月次内訳】月 / コホート数 / 月次 / 累積 / vs日経 / 勝率")
+        for m in monthly:
+            mvs = m.get("cum_vs_nikkei")
+            mwr = m.get("cohort_win_rate")
+            lines.append(
+                f"{m['month']} / {m['cohorts']}件 / {m['month_return']:+.1f}% / "
+                f"{m['cum_return']:+.1f}% / "
+                + (f"{mvs:+.1f}pt" if mvs is not None else "—") + " / "
+                + (f"{mwr:.0f}%" if mwr is not None else "—"))
+    return lines
+
+
+_HORIZON_LABELS = {"1d": "1日後", "3d": "3営業日後", "5d": "1週間後", "20d": "1ヶ月後"}
+
+
+def build_monthly_report_text(monthly_summary, month_label=None):
+    """
+    月次成績レポート（機能拡張1）。毎月最初の営業日に朝配信へ1通追加する。
+
+    含める内容（勝った月も負けた月も同じ書式・一貫基準）:
+      累積リターン／勝率／平均騰落率／最大ドローダウン／対日経の超過リターン
+      ＋期間別（1日/3営/1週/1ヶ月）の平均と勝率 ＋月次内訳表 ＋免責。
+    monthly_summary は recommendation_tracker.monthly_summary() の戻り値。
+    """
+    ms = monthly_summary or {}
+    p = ms.get("performance") or {}
+    lines = [f"【月次成績レポート】{month_label or ''}".rstrip(),
+             "", "⚠️ " + STRONG_DISCLAIMER_HEAD, ""]
+
+    if not p.get("available"):
+        lines.append("成績は集計中です（確定した掲載銘柄がまだ不足しています）。")
+        lines.append("集計基準: 掲載日終値→5立会い日後終値で確定・等加重・"
+                     "週次非重複の複利連鎖。蓄積が進み次第、毎月同じ基準で開示します。")
+        lines.append("")
+        lines.append("⚠️ " + STRONG_DISCLAIMER_TAIL)
+        return "\n".join(lines)
+
+    vs = p.get("cum_vs_nikkei")
+    lines.append("■ 累積成績（スクリーニング上位群 vs 日経平均）")
+    lines.append(f"・累積リターン：{p['cum_return']:+.2f}%"
+                 + (f"（日経 {p['cum_nikkei']:+.2f}% / 超過 {vs:+.2f}pt）"
+                    if vs is not None else ""))
+    if p.get("cohort_win_rate") is not None:
+        lines.append(f"・勝率：コホート {p['cohort_win_rate']:.1f}%"
+                     + (f" / 銘柄 {p['pick_win_rate']:.1f}%"
+                        if p.get("pick_win_rate") is not None else ""))
+    if p.get("avg_cohort_return") is not None:
+        lines.append(f"・平均騰落率（コホート）：{p['avg_cohort_return']:+.2f}%")
+    if p.get("max_drawdown") is not None:
+        lines.append(f"・最大ドローダウン：{p['max_drawdown']:.2f}%")
+    lines.append(f"・対象：{p.get('first_date','')}〜{p.get('last_date','')}"
+                 f"（{p.get('chain_cohorts',0)}コホート・{p.get('pick_count',0)}銘柄）")
+    lines.append("")
+
+    horizons = ms.get("horizons") or {}
+    if horizons:
+        lines.append("■ 期間別（全掲載銘柄・平均騰落率／勝率／対日経）")
+        for key in ("1d", "3d", "5d", "20d"):
+            h = horizons.get(key)
+            if not h:
+                continue
+            vsn = (f" / 対日経 {h['avg_vs_nikkei']:+.2f}pt"
+                   if h.get("avg_vs_nikkei") is not None else "")
+            lines.append(f"・{_HORIZON_LABELS[key]}：{h['avg_return']:+.2f}% / "
+                         f"勝率 {h['win_rate']:.0f}%{vsn}（{h['n']}件）")
+        lines.append("")
+
+    monthly = p.get("monthly") or []
+    if monthly:
+        lines.append("■ 月次内訳（月次 / 累積 / vs日経 / 勝率）")
+        for m in monthly:
+            mvs = m.get("cum_vs_nikkei")
+            mwr = m.get("cohort_win_rate")
+            lines.append(
+                f"{m['month']}: {m['month_return']:+.1f}% / {m['cum_return']:+.1f}% / "
+                + (f"{mvs:+.1f}pt" if mvs is not None else "—") + " / "
+                + (f"{mwr:.0f}%" if mwr is not None else "—"))
+        lines.append("")
+
+    lines.append("集計基準: 掲載日終値→5立会い日後終値で確定・等加重・週次非重複の"
+                 "複利連鎖。全期間を同一基準で集計し、期間の取り方による見せ方の操作は"
+                 "行いません。生データ（全掲載銘柄・全期間）は蓄積・保全しています。")
+    lines.append("")
+    lines.append("⚠️ " + STRONG_DISCLAIMER_TAIL)
+    return _clip_text("\n".join(lines), 4800)
 
 
 def _followup_validation_text(validations):
@@ -644,7 +818,8 @@ def _followup_validation_text(validations):
 
 
 def _followup_sections(market, scored_stocks, stats, validations,
-                       macro_context, theme_ranking):
+                       macro_context, theme_ranking, performance=None,
+                       tracking_lines=None):
     """
     補足テキスト（3通目）の本文＝**カードに載らない深掘り**。
 
@@ -655,15 +830,20 @@ def _followup_sections(market, scored_stocks, stats, validations,
     mc = macro_context or {}
     lines = []
 
-    # 今日のニュース・マクロ環境（詳細文章）
+    # 今日のニュース・マクロ環境（詳細文章）。機能3: 前日と酷似／変化なしは落とす。
+    import macro_state
+    fresh = mc.get("_freshness")
     lines.append("■ 今日のニュース・マクロ環境")
+    fresh_note = (fresh or {}).get("note")
+    if fresh_note:
+        lines.append(fresh_note)
     for b in _followup_macro_bullets(market, scored_stocks, stats, macro_context):
         lines.append(f"・{b}")
     for label, key in [("為替", "fx_comment"), ("米国市場", "us_market_comment"),
                        ("金利", "rates_comment"), ("商品・資源", "commodity_comment"),
                        ("地政学", "geopolitical_comment")]:
         val = (mc.get(key) or "").strip()
-        if val:
+        if val and macro_state.is_fresh(fresh, key):
             lines.append(f"・{label}：{val}")
     pos = mc.get("positive_theme_tags") or []
     cau = mc.get("caution_theme_tags") or []
@@ -697,6 +877,15 @@ def _followup_sections(market, scored_stocks, stats, validations,
     lines.extend(rows or ["（集計は蓄積中です）"])
     lines.append("")
 
+    # 掲載銘柄の追跡（機能拡張2: イベント＋監視中の経過。followup.build_morning_section の行）
+    if tracking_lines:
+        lines.extend(tracking_lines)
+        lines.append("")
+
+    # 累積成績（月次・機能4）＝サービスの継続開示の中核
+    lines.extend(_performance_followup_lines(performance))
+    lines.append("")
+
     lines.append("■ 検証結果（多期間）")
     lines.append(_followup_validation_text(validations))
     return lines
@@ -704,38 +893,42 @@ def _followup_sections(market, scored_stocks, stats, validations,
 
 def build_followup_text(market, scored_stocks, stats=None, validations=None,
                         macro_context=None, theme_ranking=None, now_str=None,
-                        basis_label=None):
+                        basis_label=None, performance=None, tracking_lines=None):
     """
     カードの後に送る「短い補足テキスト」（最大1500字・目安1000字以内）。
 
     銘柄ごとの詳細（評価グラフ・加点/減点・ニュース環境・リスクメモ）は
     すべて横スライドカードに集約しているため、ここでは繰り返さない。
-    含めるのは: 今日のニュース・マクロ環境／今日強いテーマ／テーマ別確認銘柄／検証結果。
+    含めるのは: 冒頭免責／今日のニュース・マクロ環境／今日強いテーマ／
+    テーマ別確認銘柄／累積成績／検証結果／末尾免責。
     """
-    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = now_str or _now_str()
     head2 = basis_label or f"{SUBTITLE} ・ {now_str}"
-    parts = ["【補足レポート（深掘り）】", head2, "", "カードに載らないマクロ・テーマ・検証の詳細です。", ""]
+    parts = ["【補足レポート（深掘り）】", head2, "",
+             "⚠️ " + STRONG_DISCLAIMER_HEAD, "",
+             "カードに載らないマクロ・テーマ・成績・検証の詳細です。", ""]
     parts.extend(_followup_sections(
-        market, scored_stocks, stats, validations, macro_context, theme_ranking))
+        market, scored_stocks, stats, validations, macro_context, theme_ranking,
+        performance=performance, tracking_lines=tracking_lines))
     parts.append("")
-    parts.append("※本レポートは公開データをもとにした機械的なスクリーニング結果であり、"
-                 "特定銘柄の売買を推奨するものではありません。")
-    # 深掘りレポートとして、マクロ/テーマ/検証を収める（カードは短く・こちらは詳しく）。
-    return _clip_text("\n".join(parts), 2400)
+    parts.append("⚠️ " + STRONG_DISCLAIMER_TAIL)
+    # 深掘りレポートとして、マクロ/テーマ/追跡/成績/検証を収める（カードは短く・こちらは詳しく）。
+    return _clip_text("\n".join(parts), 2800)
 
 
 def build_fallback_text(market, scored_stocks, stats=None, validations=None,
                         macro_context=None, theme_ranking=None, now_str=None,
-                        basis_label=None):
+                        basis_label=None, performance=None):
     """
     Flexカードの送信に失敗したときだけ使う短縮テキスト。
 
     カードが届かないため、上位銘柄を1行ずつ（名称・コード・評価点・テーマ）だけ補い、
     続けて補足テキスト本文を載せる。長文にはせず、最大1500字に収める。
     """
-    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = now_str or _now_str()
     head2 = basis_label or f"{SUBTITLE} ・ {now_str}"
-    parts = [f"【{TITLE}】（カード表示の代替・短縮版）", head2, ""]
+    parts = [f"【{TITLE}】（カード表示の代替・短縮版）", head2, "",
+             "⚠️ " + STRONG_DISCLAIMER_HEAD, ""]
     parts.append(f"■ スクリーニング上位{len(scored_stocks)}銘柄")
     if scored_stocks:
         for i, s in enumerate(scored_stocks, start=1):
@@ -748,11 +941,11 @@ def build_fallback_text(market, scored_stocks, stats=None, validations=None,
         parts.append("条件を満たす銘柄は今回ありませんでした。")
     parts.append("")
     parts.extend(_followup_sections(
-        market, scored_stocks, stats, validations, macro_context, theme_ranking))
+        market, scored_stocks, stats, validations, macro_context, theme_ranking,
+        performance=performance))
     parts.append("")
-    parts.append("※公開データをもとにした機械的なスクリーニング結果であり、"
-                 "特定銘柄の売買を推奨するものではありません。")
-    return _clip_text("\n".join(parts), 1500)
+    parts.append("⚠️ " + STRONG_DISCLAIMER_TAIL)
+    return _clip_text("\n".join(parts), 1800)
 
 
 def build_report(market, scored_stocks, stats=None, validations=None,
@@ -764,7 +957,7 @@ def build_report(market, scored_stocks, stats=None, validations=None,
     ＋短い補足テキスト build_followup_text()）で構成し、銘柄詳細はカードに集約する。
     この関数はターミナルでの確認用、および将来の別チャネル（Web/PDF）向けに残している。
     """
-    now = datetime.now().strftime("%Y/%m/%d %H:%M")
+    now = _now_str()
     parts = [f"【{TITLE}】", SUBTITLE, basis_label or "", f"配信 {now}", "", DESCRIPTION, ""]
 
     parts.append("■ 今日の市場概況")
@@ -852,7 +1045,8 @@ _TEMP_PALETTE = {
 
 def build_flex_message(market, scored_stocks, stats=None, validations=None,
                        macro_context=None, theme_ranking=None, now_str=None,
-                       basis_label=None, pass_rate_ctx=None, self_ref_lines=None):
+                       basis_label=None, pass_rate_ctx=None, self_ref_lines=None,
+                       performance=None):
     """
     LINEの「サマリーカード」（トップページ）。**3ブロック構成**で1分で全体像がつかめる。
 
@@ -864,7 +1058,7 @@ def build_flex_message(market, scored_stocks, stats=None, validations=None,
     マクロ環境の文章・テーマの詳細・関連テーマ一覧・今日強いテーマは補足レポート(3通目)へ移動。
     basis_label には「データ基準日：M月D日 大引け時点」を渡す（データ鮮度の明示）。
     """
-    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = now_str or _now_str()
     judgment = si.market_judgment(market, stats)
     temp = si.daily_temperature(scored_stocks, market, stats, judgment)
 
@@ -880,6 +1074,16 @@ def build_flex_message(market, scored_stocks, stats=None, validations=None,
     }
 
     body = []
+
+    # ── 冒頭免責（強）＝機能2。カード先頭に必ず表示する ──
+    body.append({
+        "type": "box", "layout": "vertical", "backgroundColor": "#FDF3F3",
+        "cornerRadius": "8px", "paddingAll": "10px", "spacing": "xs", "contents": [
+            _flex_text("⚠️ はじめにお読みください", size="xxs", color="#B23B3B",
+                       weight="bold"),
+            _flex_text(STRONG_DISCLAIMER_HEAD, size="xxs", color="#8A4A4A", wrap=True),
+        ],
+    })
 
     # ── ブロック1: 今日の温度感 ＋ 相場判定（星は使わずラベル＋配色で表現）──
     tp = _TEMP_PALETTE.get(temp["tone"], _TEMP_PALETTE["neutral"])
@@ -945,11 +1149,18 @@ def build_flex_message(market, scored_stocks, stats=None, validations=None,
     for ln in (self_ref_lines or []):  # P1-2: スコアと結果を接続した自己言及文
         body.append(_flex_bullet(ln, color="#3C4450"))
 
+    # ── ブロック4: 累積成績（月次・機能4）。勝った月も負けた月も一貫基準で開示 ──
+    body.append({"type": "separator", "margin": "md"})
+    body.append(_flex_text("📊 累積成績（スクリーニング上位群 vs 日経平均）", size="xs",
+                           color="#888888", margin="md"))
+    for pl in _performance_card_lines(performance):
+        body.append(_flex_text(pl, size="sm", color="#333333", wrap=True))
+
     footer = {
-        "type": "box", "layout": "vertical", "paddingAll": "10px", "contents": [
-            _flex_text("売買推奨ではありません。機械的なスクリーニング結果です。"
-                       "投資判断はご自身の責任で。",
-                       size="xxs", color="#AAAAAA", wrap=True),
+        "type": "box", "layout": "vertical", "paddingAll": "10px", "spacing": "xs",
+        "contents": [
+            _flex_text("⚠️ " + STRONG_DISCLAIMER_TAIL, size="xxs", color="#9A6060",
+                       wrap=True),
         ],
     }
 
@@ -1124,6 +1335,15 @@ def _stock_bubble(rank, s, macro_context=None, include_graph=True):
     body_contents.append(_flex_kv_line("テーマ", _theme_line(s)))
     body_contents.append(_flex_kv_line("ニュース", _card_news(s)))
 
+    # ✅ 選定根拠（どの条件に何個一致したか・機械的チェックリスト＝機能1）
+    basis = si.selection_basis(s)
+    body_contents.append(_flex_icon_head("✅", f"選定根拠（{basis['summary']}）"))
+    if basis["items"]:
+        for it in basis["items"]:
+            body_contents.append(_flex_bullet(it, color="#1B7F3B"))
+    else:
+        body_contents.append(_flex_bullet("機械的条件の明確な一致は限定的", color="#8A8F98"))
+
     # 📊 需給・資金（機関投資家視点・機械的推定）
     body_contents.append(_flex_icon_head("📊", "需給・資金（機械的推定）"))
     body_contents.append(_flex_bullet(inst["volume"]))
@@ -1138,14 +1358,27 @@ def _stock_bubble(rank, s, macro_context=None, include_graph=True):
         body_contents.append(
             _flex_bullet(it, color=("#3C4450" if events["has_event"] else "#8A8F98")))
 
-    # 📈 テクニカル節目（参考）。算出できない行（上値メド更新中・レンジ欠損）は非表示。
-    body_contents.append(_flex_icon_head("📈", "テクニカル節目（参考）"))
+    # 📈 テクニカル節目・機械的な目安（参考）。算出できない行は非表示。
+    body_contents.append(_flex_icon_head("📈", "テクニカル節目・目安（参考値）"))
     body_contents.append(_flex_kv_line("下値メド", tech["support"]))
     if tech["resistance"]:
         body_contents.append(_flex_kv_line("上値メド", tech["resistance"]))
+    # 参考の下値ライン（ATR・直近安値ベース＝機能2）と根拠一言
+    if tech.get("downside"):
+        body_contents.append(_flex_kv_line("参考下値ライン", tech["downside"]))
+        if tech.get("downside_note"):
+            body_contents.append(_flex_text(tech["downside_note"], size="xxs",
+                                            color="#AEB4BC", wrap=True, margin="xs"))
+    # 目安の保有期間（正式な成績集計＝5立会い日基準と一致）
+    if tech.get("holding"):
+        body_contents.append(_flex_kv_line("目安保有期間", tech["holding"]))
     if tech["range"]:
         body_contents.append(_flex_text(f"直近レンジ {tech['range']}／{tech['note']}",
                                         size="xxs", color="#AEB4BC", wrap=True, margin="xs"))
+    body_contents.append(_flex_text(
+        "※上記の価格・期間はスクリーニング条件から機械的に算出した参考値です"
+        "（売買推奨ではありません）。",
+        size="xxs", color="#AEB4BC", wrap=True, margin="xs"))
 
     # 評価グラフ（相対7軸）※サイズ保護時は省略
     if include_graph:
@@ -1170,9 +1403,20 @@ def _stock_bubble(rank, s, macro_context=None, include_graph=True):
     body = {"type": "box", "layout": "vertical", "paddingAll": "18px",
             "spacing": "sm", "contents": body_contents}
 
+    # 「気になる」ボタン（機能拡張3）: 押した読者にだけ、この銘柄のフォローアップ
+    # （上値メド到達・参考下値ライン割れ・満了）を個別通知する。Webhook未設定の間は
+    # 押しても何も起きないだけで、配信自体には影響しない。
+    from urllib.parse import urlencode
+    interest_data = urlencode({"action": "interest", "code": s.get("code", ""),
+                               "name": (s.get("name") or "")[:40]})
     footer = {
         "type": "box", "layout": "vertical", "paddingAll": "12px", "spacing": "xs",
         "backgroundColor": "#FAFAFB", "contents": [
+            {"type": "button", "height": "sm", "style": "primary",
+             "color": pal["accent"],
+             "action": {"type": "postback", "data": interest_data,
+                        "displayText": f"「気になる」に登録: {s.get('name', '')}",
+                        "label": "⭐ 気になる（追跡通知を受け取る）"}},
             _flex_text("※売買推奨ではありません（公開データをもとにした機械的な抽出結果）",
                        size="xxs", color="#9AA0A6", wrap=True),
             _flex_text("← → 横スライドで他の銘柄も確認できます",
@@ -1196,7 +1440,7 @@ def build_stock_cards(scored_stocks, macro_context=None, now_str=None):
     """
     if not scored_stocks:
         return None
-    now_str = now_str or datetime.now().strftime("%Y/%m/%d %H:%M")
+    now_str = now_str or _now_str()
     bubbles = [_stock_bubble(i, s, macro_context) for i, s in enumerate(scored_stocks, start=1)]
     carousel = {"type": "carousel", "contents": bubbles}
 

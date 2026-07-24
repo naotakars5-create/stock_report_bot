@@ -1,0 +1,64 @@
+name: Intraday Monitor
+
+# 場中モニタ（機能拡張2）: 監視中の推奨銘柄のイベント（上値メド到達／
+# 参考下値ライン割れ）を検知し、登録読者にのみ即時通知する。
+#
+# 起動は外部cron（cron-job.org 等）からの repository_dispatch を本線とする
+# （GitHub schedule は8時間超の遅延があり「即時」にならないため使わない）。
+#   POST /repos/{owner}/{repo}/dispatches  {"event_type":"intraday-monitor"}
+#   → 平日 9:00〜15:30 JST に30分毎を推奨（場外・休場日はスクリプト側で自動スキップ）。
+#
+# メッセージ予算: 即時通知は「気になる/保有」登録読者のみが宛先のため、
+# 全読者一斉（200通/イベント）のような消費は発生しない。
+on:
+  repository_dispatch:
+    types: [intraday-monitor]
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "場外・休場日でも強制実行する（検証用）"
+        type: boolean
+        default: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write  # followup_events.csv のコミット用
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      - name: 場中モニタを実行
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          SUBSCRIBER_API_URL: ${{ secrets.SUBSCRIBER_API_URL }}
+          SUBSCRIBER_API_TOKEN: ${{ secrets.SUBSCRIBER_API_TOKEN }}
+          FORCE_RUN: ${{ inputs.force_run }}
+        run: python intraday_monitor.py
+
+      - name: イベント記録を保存（コミット）
+        # followup_events.csv を永続化し、翌朝の配信への織り込み（二重通知ガード）に使う。
+        run: |
+          if [ ! -d data ]; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git add data/
+          if git diff --staged --quiet; then
+            echo "イベント記録に変更はありません。"
+          else
+            git commit -m "Update followup events [skip ci]"
+            git push
+          fi

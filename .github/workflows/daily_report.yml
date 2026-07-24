@@ -28,6 +28,14 @@ on:
         description: "休場日でも強制実行する（手動検証用。土日祝でも配信する）"
         type: boolean
         default: false
+      test_mode:
+        description: "テスト配信（LINEに送信するが、X投稿・データ保存は行わない）"
+        type: boolean
+        default: false
+      max_stocks:
+        description: "対象銘柄数の上限（テスト時の短縮用。空=全銘柄）"
+        type: string
+        default: ""
 
 jobs:
   report:
@@ -62,6 +70,13 @@ jobs:
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
           # 手動実行で force_run=true のとき、休場日ガードを上書きして強制実行する。
           FORCE_RUN: ${{ inputs.force_run }}
+          # テスト配信: LINEに送るが X投稿・データ保存はスキップ（本番を汚さない）。
+          TEST_MODE: ${{ inputs.test_mode }}
+          # テスト時の短縮用（空=全銘柄）。
+          MAX_STOCKS: ${{ inputs.max_stocks }}
+          # 読者設定API（Worker未デプロイなら未設定のままでよい＝従来配信）。
+          SUBSCRIBER_API_URL: ${{ secrets.SUBSCRIBER_API_URL }}
+          SUBSCRIBER_API_TOKEN: ${{ secrets.SUBSCRIBER_API_TOKEN }}
           # 【機能1-a】朝ダイジェストのX投稿用（未設定なら投稿はスキップされる）。
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
@@ -70,10 +85,12 @@ jobs:
           LINE_ADD_FRIEND_URL: ${{ secrets.LINE_ADD_FRIEND_URL }}
         run: python main.py
 
-      - name: 前回検証用の履歴・日次集計を保存（コミット）
-        # スクリーニング結果の履歴(data/report_history.csv)と日次集計
-        # (data/daily_stats.csv)をリポジトリへ反映し、次回実行時の「前回レポートの
-        # 検証」「通過率のパーセンタイル表示(P1-3)」に使えるようにする。
+      - name: 前回検証用の履歴・日次集計・成績台帳・マクロ状態を保存（コミット）
+        # data/ 配下をリポジトリへ反映し、次回実行時の各機能に使えるようにする:
+        #   report_history.csv  … 前回レポートの検証
+        #   daily_stats.csv     … 通過率のパーセンタイル表示(P1-3)
+        #   pick_ledger.csv / performance_monthly.csv … 累積成績(機能4)の継続蓄積
+        #   macro_state.json    … マクロ鮮度(機能3)の前日比較の基準
         run: |
           if [ ! -d data ]; then
             echo "data ディレクトリが無いためスキップします。"
@@ -81,10 +98,12 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 場中モニタ(intraday_monitor)も data/ をコミットするため、push衝突を避ける
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
           git add data/
           if git diff --staged --quiet; then
             echo "履歴・集計に変更はありません。"
           else
-            git commit -m "Update report history and daily stats [skip ci]"
+            git commit -m "Update report history, stats, performance ledger and macro state [skip ci]"
             git push
           fi

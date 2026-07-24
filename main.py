@@ -41,8 +41,16 @@ import macro_analyzer
 import stock_scorer
 import report_writer
 import report_history
+import performance
+import macro_state
 import line_sender
 import market_calendar
+import recommendation_tracker
+import followup
+import subscriber_store
+import personalize
+import sector_valuation
+import catalyst
 
 
 def _int_env(name, default):
@@ -147,6 +155,147 @@ def _attach_calendar(scored_stocks):
     return scored_stocks
 
 
+def _build_performance(today_str, nikkei_df, persist=True):
+    """
+    【機能4】成績台帳を同期し、累積成績サマリー（月次含む）を作る。
+
+    過去コホート（report_history の全上位5銘柄）を成績台帳に取り込み、5立会い日
+    保有・週次非重複・等加重の複利連鎖で累積成績を集計する。1銘柄の exit 終値は
+    yfinance の日足から「抽出日終値の5立会い日後」を取得して確定する。
+    取得・集計に失敗しても配信本体は止めない（成績は「集計中」表示にフォールバック）。
+    """
+    def price_history_provider(code):
+        ticker = code if "." in str(code) else f"{code}.T"
+        # 5立会い日後の終値まで見られれば十分。3か月あれば直近コホートを確定できる。
+        return data_fetcher._download_history(ticker, period="3mo")
+
+    try:
+        history_rows = report_history.all_history_rows()
+        nikkei_close = nikkei_df if nikkei_df is not None else None
+        summary = performance.sync_and_summarize(
+            today_str, history_rows, price_history_provider,
+            benchmark_series=nikkei_close, persist=persist)
+        if summary.get("available"):
+            print(f"[成績] 累積リターン {summary['cum_return']:+.2f}% / "
+                  f"コホート勝率 {summary.get('cohort_win_rate', 0):.0f}% / "
+                  f"最大DD {summary.get('max_drawdown', 0):.1f}%（"
+                  f"{summary.get('chain_cohorts', 0)}コホート・非重複）")
+        else:
+            print("[成績] 累積成績は集計中（確定コホートが未成熟／不足）。")
+        return summary
+    except Exception as e:
+        print(f"[警告] 累積成績の集計で予期せぬエラー（集計中表示にフォールバック）: {e}")
+        return {"available": False, "monthly": []}
+
+
+def _build_tracking(today_str, today, price_map, nikkei_df, persist=True):
+    """
+    【機能拡張1・2】推奨追跡の一括処理。
+
+      1. 既存 pick_ledger からの初回移行（冪等・persist時のみ）
+      2. 多期間（1d/3d/5d/20d）リターンの確定（price_tracks.csv 追記）
+      3. 目安保有期間（5立会い日）満了のクローズ＋満了イベント記録
+      4. 朝イベント判定（上値メド到達／参考下値ライン割れ・前日終値ベース）
+      5. 朝配信に織り込む「追跡」セクションの行を生成
+      6. 毎月最初の営業日なら月次成績レポートのテキストを生成
+
+    失敗しても配信本体は止めない。戻り値: (tracking_lines, monthly_text|None)
+    """
+    _hist_cache = {}
+
+    def provider(code):
+        # live と shadow の追跡で同じ銘柄を二重取得しないようキャッシュする。
+        if code not in _hist_cache:
+            ticker = code if "." in str(code) else f"{code}.T"
+            _hist_cache[code] = data_fetcher._download_history(ticker, period="3mo")
+        return _hist_cache[code]
+
+    tracking_lines, monthly_text = [], None
+    try:
+        if persist:
+            recommendation_tracker.migrate_from_pick_ledger()
+            recommendation_tracker.update_tracks(today_str, provider,
+                                                 nikkei_series=nikkei_df)
+            closed = recommendation_tracker.close_expired(today_str)
+            followup.record_expirations(closed, today_str=today_str)
+            # 【改善A/②】各シャドウアーム(defensive/catalyst)の多期間リターンも同基準で追跡。
+            for arm in ("defensive", "catalyst"):
+                arm_recs, arm_tracks = recommendation_tracker.shadow_paths(arm)
+                recommendation_tracker.update_tracks(
+                    today_str, provider, nikkei_series=nikkei_df,
+                    recs_path=arm_recs, tracks_path=arm_tracks)
+
+        # 朝のイベント判定（前日終値ベース）。場中モニタと同じ二重通知ガードを共有。
+        open_recs = recommendation_tracker.open_recommendations()
+        events = followup.detect_events(open_recs, price_map, today_str=today_str)
+        if events and persist:
+            followup.record_events(events)
+        tracking_lines = followup.build_morning_section(
+            events_today=events, open_recs=open_recs, current_prices=price_map,
+            persist=persist)
+
+        # 月次レポート: 毎月最初の営業日に1通（前月までの全期間を一貫基準で開示）。
+        prev_bd = market_calendar.previous_trading_day(today)
+        if prev_bd.month != today.month:
+            msum = recommendation_tracker.monthly_summary()
+            label = f"{prev_bd.year}年{prev_bd.month}月度まで"
+            monthly_text = report_writer.build_monthly_report_text(msum, label)
+            print(f"[月次] {label} の成績レポートを配信に追加します。")
+    except Exception as e:
+        print(f"[警告] 推奨追跡の処理で予期せぬエラー（配信は継続）: {e}")
+    return tracking_lines, monthly_text
+
+
+def _deliver_to_subscribers(flex_messages, followup_text, monthly_text=None,
+                            scored_stocks=None, dry_run=False):
+    """
+    【機能拡張3】読者への multicast 配信（読者設定があるときのみ使用）。
+
+    - 価格帯フィルタの結果が同じ読者をグループ化し、グループごとに
+      「サマリーカード＋（フィルタ済み）銘柄カルーセル＋補足テキスト（＋月次）」を
+      **1リクエストに束ねて** multicast（＝1通/人。メッセージ予算の最小化）。
+    - 設定なしの読者には全銘柄版が届く（従来体験の維持）。
+    戻り値: 配信した読者数（0 なら呼び出し側で従来配信にフォールバック）。
+    """
+    try:
+        settings = subscriber_store.load_settings()
+    except Exception as e:
+        print(f"[警告] 読者設定の取得に失敗（従来配信へ）: {e}")
+        return 0
+    users = [u for u in settings["users"] if u["active"]]
+    if not users:
+        return 0
+
+    groups = personalize.group_users(users, scored_stocks or [])
+    total = len(scored_stocks or [])
+    sent = 0
+    for g in groups:
+        msgs = []
+        # サマリーカードは全グループ共通（上位5の顔ぶれは透明性のため隠さない）
+        if flex_messages:
+            alt, contents = flex_messages[0]
+            msgs.append({"type": "flex", "altText": alt, "contents": contents})
+        # カルーセルはグループごとにフィルタ済み銘柄で再構築
+        cards = report_writer.build_stock_cards(g["stocks"]) if g["stocks"] else None
+        if cards:
+            msgs.append({"type": "flex", "altText": cards[0], "contents": cards[1]})
+        text = followup_text or ""
+        note = personalize.filtered_note(g, total)
+        if note:
+            text = note + "\n\n" + text
+        if text.strip():
+            msgs.append({"type": "text", "text": text[:4900]})
+        if monthly_text:
+            msgs.append({"type": "text", "text": monthly_text[:4900]})
+        status = line_sender.send_multicast(
+            msgs, g["user_ids"], dry_run=dry_run,
+            label=f"朝配信({'全銘柄版' if g['is_default'] else 'フィルタ版'}"
+                  f"・{len(g['user_ids'])}人)")
+        if status in ("sent", "dry-run"):
+            sent += len(g["user_ids"])
+    return sent
+
+
 def _build_validations(current_prices, nikkei_df, benchmark_df, today_str):
     """過去の上位5銘柄を、前回・3営業日前・1週間前の各回でデータがある範囲で検証する。"""
     runs = report_history.load_runs(before_date=today_str)
@@ -173,25 +322,32 @@ def main(dry_run=False):
     #   スケジュール実行・手動実行(workflow_dispatch)の両方で先頭に判定する。
     #   ただし手動検証のため FORCE_RUN=true のときは休場日でも実行する（上書き）。
     force_run = (os.environ.get("FORCE_RUN") or "").strip().lower() in ("1", "true", "yes", "on")
+    # 【テスト配信モード】TEST_MODE=true: LINEには実際に配信する（内容確認用）が、
+    #   X投稿・履歴/集計/追跡データの保存は一切行わない（本番データ・公開投稿を汚さない）。
+    #   休場日・配信済みガードも上書きして、いつでも安全に試し配信できる。
+    test_mode = (os.environ.get("TEST_MODE") or "").strip().lower() in ("1", "true", "yes", "on")
+    if test_mode:
+        print("  実行モード: TEST_MODE（LINEに送信 / X投稿・データ保存はスキップ）")
     today = market_calendar.today_jst()
     is_open, reason = market_calendar.is_market_open(today)
-    if not is_open and not force_run:
+    if not is_open and not (force_run or test_mode):
         print(f"Market closed: {today} ({reason})")
         print("休場日のため配信をスキップして正常終了します。")
         return 0
-    if not is_open and force_run:
-        print(f"[強制実行] {today} は休場日（{reason}）ですが、FORCE_RUN のため実行します"
+    if not is_open and (force_run or test_mode):
+        print(f"[強制実行] {today} は休場日（{reason}）ですが実行します"
               "（手動検証用）。休場日データの汚染を避けるため履歴・集計は保存しません。")
-    # 休場日の強制実行では、週末の据え置きデータで履歴を汚さないよう永続化を抑止する。
-    skip_persist = force_run and not is_open
+    # 休場日の強制実行・テスト配信では、履歴を汚さないよう永続化と公開X投稿を抑止する。
+    skip_persist = (force_run and not is_open) or test_mode
 
     # 【二重配信ガード】同じ日に既に配信済みなら、何もせず正常終了する。
     #   配信時刻の正確性のため外部cron(repository_dispatch)で起動しつつ、保険として
     #   GitHubのschedule(遅延起動あり)も残しているため、両方走ると1日2回配信になり得る。
     #   daily_stats は配信のたびに必ず1行保存されるので、それをマーカーに使う。
-    #   （dry-run と強制実行はテスト用途なので対象外）
+    #   （dry-run・強制実行・テスト配信はテスト用途なので対象外）
     today_str = today.strftime("%Y-%m-%d")
-    if not dry_run and not force_run and report_history.has_daily_stat(today_str):
+    if (not dry_run and not force_run and not test_mode
+            and report_history.has_daily_stat(today_str)):
         print(f"[スキップ] 本日({today_str})は既に配信済みのため、重複配信を防いで終了します。")
         return 0
 
@@ -323,11 +479,62 @@ def main(dry_run=False):
         # バリュエーション（best-effort）
         valuations = _fetch_valuations(detail_histories)
 
+        # 【改善3】業種PERキャッシュを更新し、業種中央値を上位銘柄に付与する。
+        #   selection_basis が「PER業種中央値以下（当社集計）」の判定に使う。
+        #   サンプル不足の業種は付与されず、従来の絶対水準判定にフォールバック。
+        sectors_map = {it["code"]: (it.get("sector") or "") for it in detail_histories}
+        if not (dry_run or skip_persist):
+            sector_valuation.update_cache(valuations, sectors_map, today_str)
+        sector_medians = sector_valuation.sector_medians()
+        if sector_medians:
+            print(f"[業種PER] 中央値を算出できた業種: {len(sector_medians)} 業種")
+
         scored_stocks = stock_scorer.score_all(
             detail_histories, benchmark_df=benchmark_df, top_n=FINAL_TOP_N,
             profiles=profiles_map, valuations=valuations, previous_codes=previous_codes,
             macro_context=macro_context, theme_ranking_out=theme_ranking,
         )
+        sector_valuation.attach_sector_median(scored_stocks, sector_medians)
+
+        # 【改善A/②】守り仮説・カタリスト仮説の検証: 配信しない2つのアームの上位5を
+        #   「シャドウ」で算出・記録し、balanced（本番）と成績を突き合わせる（forward A/B）。
+        #   本番配信(scored_stocks)は一切変えない。
+        if not (dry_run or skip_persist):
+            # defensive（守り）: 同じ detail_histories を使うので追加取得なし。
+            try:
+                shadow_def = stock_scorer.score_all(
+                    detail_histories, benchmark_df=benchmark_df, top_n=FINAL_TOP_N,
+                    profiles=profiles_map, valuations=valuations,
+                    previous_codes=previous_codes, macro_context=macro_context,
+                    scoring_profile="defensive")
+                recommendation_tracker.record_today(
+                    shadow_def, run_date=today_str,
+                    path=recommendation_tracker.shadow_paths("defensive")[0])
+                print(f"[シャドウ] defensive 上位{len(shadow_def)}銘柄を記録（配信せず）。")
+            except Exception as e:
+                print(f"[警告] シャドウ(defensive)記録で例外（配信は継続）: {e}")
+            # catalyst（イベント連動）: balanced候補プール(最大15)の決算日を取得し、
+            #   決算跨ぎ回避＋決算後ドリフト近似で並べ替えて上位5を記録する。
+            try:
+                pool = stock_scorer.score_all(
+                    detail_histories, benchmark_df=benchmark_df, top_n=15,
+                    profiles=profiles_map, valuations=valuations,
+                    previous_codes=previous_codes, macro_context=macro_context)
+                cals = {}
+                for s in pool:
+                    code = s.get("code", "")
+                    tk = code if "." in code else f"{code}.T"
+                    try:
+                        cals[code] = data_fetcher.get_calendar_events(tk)
+                    except Exception:
+                        cals[code] = {}
+                shadow_cat = catalyst.rerank(pool, cals, today=today, top_n=FINAL_TOP_N)
+                recommendation_tracker.record_today(
+                    shadow_cat, run_date=today_str,
+                    path=recommendation_tracker.shadow_paths("catalyst")[0])
+                print(f"[シャドウ] catalyst 上位{len(shadow_cat)}銘柄を記録（配信せず）。")
+            except Exception as e:
+                print(f"[警告] シャドウ(catalyst)記録で例外（配信は継続）: {e}")
     else:
         print("[情報] 一次スクリーニングを通過した銘柄はありませんでした。")
     stats["final"] = len(scored_stocks)
@@ -337,8 +544,36 @@ def main(dry_run=False):
         print("\n■ 上位銘柄の決算・配当カレンダーを取得（取得可能な範囲のみ）")
         _attach_calendar(scored_stocks)
 
-    # 5. 過去レポートの検証（前回・3営業日前・1週間前を、データがある範囲で）
-    validations = _build_validations(price_map, nikkei_df, benchmark_df, today_str)
+    # dry-run／休場日の強制実行／テスト配信では永続化しない（データ汚染防止）。
+    no_persist = dry_run or skip_persist
+
+    # 5. 【機能拡張1・2】推奨追跡: 多期間リターンの確定・満了クローズ・
+    #    朝配信に織り込む「追跡」セクション、月次成績レポートの生成。
+    #    ※検証ビューがこの確定データを使うため、検証より先に実行する。
+    tracking_lines, monthly_text = _build_tracking(
+        today_str, today, price_map, nikkei_df, persist=not no_persist)
+
+    # 5.2 検証（前回・3営業日前・1週間前）。price_tracks を単一ソースとし、
+    #     追跡・累積成績と同じ基準の確定値で表示する（2系統併走の食い違い排除）。
+    #     トラックがまだ無い移行期は、従来の report_history 検証にフォールバック。
+    validations = []
+    try:
+        validations = recommendation_tracker.validation_views(today_str)
+    except Exception as e:
+        print(f"[警告] 検証ビューの生成に失敗（従来方式へ）: {e}")
+    if not validations:
+        validations = _build_validations(price_map, nikkei_df, benchmark_df, today_str)
+
+    # 5.5 【機能3】マクロ解説の鮮度担保: 前日配信のマクロ文と当日文の類似度を測り、
+    #     酷似（使い回し）や前日から数値変化のない項目を落とす。判定結果を
+    #     macro_context["_freshness"] に載せ、配信文生成側で「その日ならでは」に絞る。
+    prev_macro_state = macro_state.load_state()
+    macro_context["_freshness"] = macro_state.evaluate_freshness(
+        macro_context, market=market, prev_state=prev_macro_state)
+
+    # 5.6 【機能4】累積成績: 過去コホート（上位5銘柄）を成績台帳に反映し、5立会い日
+    #     保有・週次非重複・等加重の複利連鎖で累積リターン/勝率/最大DD/月次を算出する。
+    performance_summary = _build_performance(today_str, nikkei_df, persist=not no_persist)
 
     # 6. レポート出力（LINEは「カード中心」）
     #    LINE送信順: (1)サマリーカード → (2)上位5銘柄の横スライドカード
@@ -380,16 +615,18 @@ def main(dry_run=False):
         macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
     followup_text = report_writer.build_followup_text(
         market, scored_stocks, stats, validations=validations,
-        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
+        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label,
+        performance=performance_summary, tracking_lines=tracking_lines)
     fallback_text = report_writer.build_fallback_text(
         market, scored_stocks, stats, validations=validations,
-        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label)
+        macro_context=macro_context, theme_ranking=theme_ranking, basis_label=basis_label,
+        performance=performance_summary)
     flex_messages = [
         report_writer.build_flex_message(
             market, scored_stocks, stats, validations=validations,
             macro_context=macro_context, theme_ranking=theme_ranking,
             basis_label=basis_label, pass_rate_ctx=pass_rate_ctx,
-            self_ref_lines=self_ref_lines)
+            self_ref_lines=self_ref_lines, performance=performance_summary)
     ]
     cards = report_writer.build_stock_cards(scored_stocks, macro_context=macro_context)
     if cards:
@@ -398,23 +635,52 @@ def main(dry_run=False):
     print(report)  # ターミナル表示のみ（LINEには送らない長文レポート）
     print("\n--- LINE補足テキスト（実際に送信する短縮版）---")
     print(followup_text)
-    _deliver(followup_text, flex_messages, fallback_text, dry_run=dry_run)
+    if monthly_text:
+        print("\n--- 月次成績レポート（本日追加配信）---")
+        print(monthly_text)
+
+    # 【機能拡張3】読者設定があれば multicast（価格帯フィルタ・1通/人に束ねる）。
+    # 読者がいない・API未設定なら従来のLINE_USER_ID宛て配信（体験は劣化しない）。
+    delivered = _deliver_to_subscribers(
+        flex_messages, followup_text, monthly_text=monthly_text,
+        scored_stocks=scored_stocks, dry_run=dry_run)
+    if delivered:
+        print(f"[LINE] 読者 {delivered} 人へ multicast 配信しました。")
+    else:
+        _deliver(followup_text, flex_messages, fallback_text, dry_run=dry_run)
+        if monthly_text:
+            line_sender.send_report(monthly_text, dry_run=dry_run)
+
+    # 【改善2】メッセージ通数の残枠監視: 今日の送信で月間上限の80%/95%を跨いだら
+    #   管理者へ警告（枠切れによる配信停止を未然に防ぐ）。使用量ログも毎回出す。
+    import message_budget
+    print(message_budget.usage_line())
+    budget_alert = message_budget.threshold_alert()
+    if budget_alert:
+        line_sender.send_admin_alert(budget_alert, dry_run=dry_run)
 
     # 6.5 【機能1-a】X へ朝ダイジェストを投稿（LINE配信の直後）。
     #     休場日の強制実行では、休場日の内容を公開投稿しないようスキップする。
     if skip_persist:
-        print("[X] 休場日の強制実行のため、X投稿はスキップします。")
+        print("[X] 休場日の強制実行またはテスト配信のため、X投稿はスキップします。")
     else:
         _post_morning_digest(today, market, scored_stocks, stats, theme_ranking,
                              dry_run=dry_run)
 
     # 7. 今回の抽出結果を履歴に保存（次回の検証用）。
     #    dry-run／休場日の強制実行では状態を変更しない（データ汚染防止）。
-    no_persist = dry_run or skip_persist
+    #    no_persist は 5.6 で算出済み（dry_run or skip_persist）。
     if scored_stocks and not no_persist:
         report_history.save_report(scored_stocks)
+        # 【機能拡張1】推奨の生記録（該当条件・目安レベル込み）。フォローアップと
+        # 多期間追跡の土台になる。
+        recommendation_tracker.record_today(scored_stocks, run_date=today_str)
     elif no_persist:
         print("[情報] 履歴・日次集計の保存はスキップしました（dry-run または休場日の強制実行）。")
+
+    # 7.2 【機能3】当日のマクロ状態を保存（次回の鮮度判定＝前日比較の基準に使う）。
+    if not no_persist:
+        macro_state.save_state(macro_context, market=market, run_date=today_str)
 
     # 7.5 日次集計（通過率・前回検証成績）を保存（P1-3 パーセンタイル用の蓄積）。
     if not no_persist:
