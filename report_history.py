@@ -22,6 +22,13 @@ import csv
 import os
 from datetime import datetime, date
 
+import market_calendar
+
+
+def _today_str():
+    """当日日付は必ず JST で。GitHub Actions は UTC 稼働のため素の now は前日にずれる。"""
+    return market_calendar.today_jst().strftime("%Y-%m-%d")
+
 
 DEFAULT_PATH = os.path.join("data", "report_history.csv")
 # top_reason/top_risk は「検証の自己言及文」(P1-2)用に、その日の主な加点理由・
@@ -58,7 +65,7 @@ def save_report(scored_stocks, path=DEFAULT_PATH, run_date=None):
     """
     if not scored_stocks:
         return False
-    run_date = run_date or datetime.now().strftime("%Y-%m-%d")
+    run_date = run_date or _today_str()
     try:
         directory = os.path.dirname(path)
         if directory:
@@ -94,6 +101,14 @@ def save_report(scored_stocks, path=DEFAULT_PATH, run_date=None):
     except Exception as e:
         print(f"[警告] レポート履歴の保存に失敗しました: {e}")
         return False
+
+
+def all_history_rows(path=DEFAULT_PATH):
+    """履歴CSVの全行（run_date/code/name/rank/price/... の生dict）を返す。
+
+    成績台帳(performance.sync_ledger)が、過去の全コホート銘柄を取り込むために使う。
+    """
+    return _read_rows(path)
 
 
 def load_runs(path=DEFAULT_PATH, before_date=None):
@@ -159,7 +174,7 @@ def select_horizon_runs(runs, today=None, targets=(1, 3, 5)):
     """
     if not runs:
         return []
-    today = today or datetime.now().strftime("%Y-%m-%d")
+    today = today or _today_str()
     labels = {1: "前回", 3: "3営業日前", 5: "1週間前"}
     chosen, used_dates = [], set()
     for tgt in targets:

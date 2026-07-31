@@ -23,6 +23,13 @@ stock_insights.py
 
 from datetime import date, datetime
 
+import market_calendar
+
+
+def _today_jst():
+    """イベントまでの残日数は JST 基準で数える（Actions は UTC 稼働のため）。"""
+    return market_calendar.today_jst()
+
 
 # ====== 表示補助 ======
 def stars(n, total=5):
@@ -101,23 +108,33 @@ def institutional_view(s):
     return {"volume": volume, "money": money, "supply": supply}
 
 
-# ====== ② テクニカル節目（参考・売買推奨ではない） ======
+# ====== ② テクニカル節目・機械的な目安（参考・売買推奨ではない） ======
+# 正式な成績集計と揃えた「目安の保有期間」。performance.HOLDING_SESSIONS と一致させる。
+REFERENCE_HOLDING_SESSIONS = 5
+
+
 def technical_levels(s):
     """
-    移動平均・直近スイング高値/安値から、価格の節目を機械的に算出する。
+    移動平均・直近スイング高値/安値・ATRから、価格の節目を機械的に算出する。
 
-    戻り値: {"support": str, "resistance": str, "range": str, "note": str}
-    ここでの「下値メド／上値メド」は客観的な価格の節目であり、
-    「押し目買い価格・利確・損切り」といった売買の指示ではない。
+    戻り値: {"support", "resistance", "range", "note",
+             "downside", "downside_note", "holding", "holding_note"}
+    ここでの「下値メド／上値メド／下値ライン」は客観的な価格の節目であり、
+    「押し目・利確・損切り」といった売買の指示ではない（すべて機械的な参考値）。
     """
     price = s.get("price")
     sma5, sma25, sma75 = _m(s, "sma5"), _m(s, "sma25"), _m(s, "sma75")
     low20, high20 = _m(s, "recent_low_20"), _m(s, "recent_high_20")
     low60, high60 = _m(s, "recent_low_60"), _m(s, "recent_high_60")
+    atr = _m(s, "atr14")
 
     if price is None:
         return {"support": "—", "resistance": "—", "range": "—",
-                "note": "価格データが取得できませんでした"}
+                "note": "価格データが取得できませんでした",
+                "downside": None, "downside_note": None,
+                "holding": None, "holding_note": None,
+                "support_value": None, "resistance_value": None,
+                "downside_value": None}
 
     # 下値メド: 価格より下の節目のうち最も近いもの
     below = [("5日線", sma5), ("25日線", sma25), ("75日線", sma75),
@@ -126,8 +143,10 @@ def technical_levels(s):
     if below:
         lbl, v = max(below, key=lambda x: x[1])
         support = f"{_fmt_price(v)}（{lbl}）"
+        support_value = v
     else:
-        support = f"{_fmt_price(low60 or low20)}（直近安値）"
+        support_value = low60 or low20
+        support = f"{_fmt_price(support_value)}（直近安値）"
 
     # 上値メド: 価格より上の節目のうち最も近いもの。無ければ None（＝行ごと非表示）。
     above = [("直近20日高値", high20), ("直近60日高値", high60)]
@@ -135,14 +154,151 @@ def technical_levels(s):
     if above:
         lbl, v = min(above, key=lambda x: x[1])
         resistance = f"{_fmt_price(v)}（{lbl}）"
+        resistance_value = v
     else:
         resistance = None  # 直近高値を更新中 → 上値メドは非表示
+        resistance_value = None
 
     rng = None
     if low20 is not None and high20 is not None:
         rng = f"{_fmt_price(low20)}〜{_fmt_price(high20)}（直近20日）"
     note = "機械的に算出した価格の節目です（参考・売買推奨ではありません）"
-    return {"support": support, "resistance": resistance, "range": rng, "note": note}
+
+    # 参考の下値ライン: 直近安値と「終値−ATR×2」の高い方を採用（客観指標ベース）。
+    #   ・直近安値: 直近20/60日の安値のうち価格より下で最も近いもの
+    #   ・ATR基準: 終値 − ATR(14)×2（平均的な値幅の2倍下）
+    # 「この水準を下回ると下値方向のリスクが意識されやすい」機械的な目安であり、
+    # 損切り指示ではない（NG語を避け『下値ライン』として提示）。
+    downside = downside_note = downside_value = None
+    swing_low = None
+    swing_below = [v for v in (low20, low60) if v is not None and v < price]
+    if swing_below:
+        swing_low = max(swing_below)  # 価格に最も近い直近安値
+    atr_line = (price - 2 * atr) if (atr is not None and atr > 0) else None
+    candidates = [x for x in (swing_low, atr_line) if x is not None and x < price]
+    if candidates:
+        level = max(candidates)  # より価格に近い（浅い）方を保守的な目安とする
+        basis = []
+        if swing_low is not None and abs(level - swing_low) < 1e-6:
+            basis.append("直近安値")
+        if atr_line is not None and abs(level - atr_line) < 1e-6:
+            basis.append("ATR(14)×2")
+        if atr is not None and atr > 0 and "ATR(14)×2" not in basis:
+            basis.append(f"ATR14={_fmt_price(atr)}")
+        downside = _fmt_price(level)
+        downside_value = level
+        pct = (level - price) / price * 100 if price else None
+        gap = f"（現値比 {pct:+.1f}%）" if pct is not None else ""
+        downside_note = f"根拠：{'・'.join(basis) or '直近安値'}{gap}。下回ると下値リスクが意識されやすい参考水準"
+
+    # 目安の保有期間（正式な成績集計＝5立会い日基準と一致）。
+    holding = f"{REFERENCE_HOLDING_SESSIONS}立会い日（約1週間）"
+    holding_note = ("短期モメンタム条件（出来高増加・短期移動平均の並び）を中心に"
+                    "抽出しているため、機械的な目安期間として設定（参考・売買推奨ではありません）")
+
+    return {"support": support, "resistance": resistance, "range": rng, "note": note,
+            "downside": downside, "downside_note": downside_note,
+            "holding": holding, "holding_note": holding_note,
+            # 数値レベル（推奨記録・フォローアップ判定用。表示は上の整形済み文字列を使う）
+            "support_value": support_value, "resistance_value": resistance_value,
+            "downside_value": downside_value}
+
+
+# ====== 選定根拠（どの条件に何個一致したか・機械的チェックリスト） ======
+def selection_basis(s):
+    """
+    銘柄がスクリーニングの各条件にいくつ一致したかを、具体値付きで列挙する（機能1）。
+
+    ブラックボックス化を避けるため、metrics から機械的に判定できる条件だけを
+    「該当N/評価可能M件」として提示する。判定に必要なデータが無い条件は
+    総数(total)から除外し（捏造しない）、一致したものは具体値を添えて items に入れる。
+
+    戻り値: {"count": int, "total": int, "items": [str, ...],
+             "summary": "該当N/M件"}
+    """
+    price = s.get("price")
+    vr = _m(s, "vol_ratio")
+    gap_5_25 = _m(s, "gap_5_25")
+    gap_25_75 = _m(s, "gap_25_75")
+    rel = _m(s, "rel_strength")
+    surge = _m(s, "surge_5")
+    per = _m(s, "per")
+    pbr = _m(s, "pbr")
+    sma25 = _m(s, "sma25")
+    tags = s.get("theme_tags") or []
+    macro_reason = s.get("macro_reason")
+
+    # (評価可能か, 一致したか, 一致時の表示文)
+    checks = []
+
+    checks.append((
+        vr is not None,
+        vr is not None and vr > 1.05,
+        (f"出来高が5日平均で25日平均比 {(vr - 1) * 100:+.0f}%" if vr is not None else ""),
+    ))
+    checks.append((
+        price is not None and sma25 is not None,
+        price is not None and sma25 is not None and price > sma25,
+        (f"25日線を上回って推移（{(price / sma25 - 1) * 100:+.1f}%）"
+         if (price is not None and sma25) else ""),
+    ))
+    checks.append((
+        gap_5_25 is not None,
+        gap_5_25 is not None and gap_5_25 > 0,
+        (f"5日線>25日線で短期上向き（乖離{gap_5_25:+.1f}%）" if gap_5_25 is not None else ""),
+    ))
+    checks.append((
+        gap_25_75 is not None,
+        gap_25_75 is not None and gap_25_75 > 0,
+        (f"25日線>75日線で中期も上向き（乖離{gap_25_75:+.1f}%）" if gap_25_75 is not None else ""),
+    ))
+    checks.append((
+        rel is not None,
+        rel is not None and rel > 0,
+        (f"市場平均(TOPIX)を20日で {rel:+.1f}pt上回る相対的な強さ" if rel is not None else ""),
+    ))
+    checks.append((
+        True,
+        bool(tags),
+        ("テーマ該当：" + "・".join(tags[:3]) if tags else ""),
+    ))
+    # 割安圏。業種PER中央値（sector_valuation のローリングキャッシュ・当社集計）が
+    # あれば「PER 業種中央値以下」で判定し、無ければ従来の絶対水準にフォールバック。
+    sector_med = s.get("sector_per_median")
+    if per is not None and per > 0 and sector_med:
+        val_evaluable = True
+        val_match = per <= sector_med
+        val_txt = (f"PER{per:.1f}倍 ≤ 業種中央値{sector_med:.1f}倍（当社集計）"
+                   if val_match else "")
+    else:
+        val_evaluable = (per is not None and per > 0) or (pbr is not None and pbr > 0)
+        val_match = ((per is not None and 0 < per <= 20)
+                     or (pbr is not None and 0 < pbr <= 1.2))
+        val_txt = ""
+        if val_match:
+            bits = []
+            if per is not None and 0 < per <= 20:
+                bits.append(f"PER{per:.1f}倍")
+            if pbr is not None and 0 < pbr <= 1.2:
+                bits.append(f"PBR{pbr:.2f}倍")
+            val_txt = "割安圏（" + "・".join(bits) + "）"
+    checks.append((val_evaluable, val_match, val_txt))
+    checks.append((
+        True,
+        bool(macro_reason),
+        (f"ニュース環境と接点：{macro_reason}" if macro_reason else ""),
+    ))
+    checks.append((
+        surge is not None,
+        surge is not None and surge < 15,
+        (f"直近5日 {surge:+.1f}%で過熱圏未満（急騰しすぎていない）" if surge is not None else ""),
+    ))
+
+    total = sum(1 for evaluable, _m2, _t in checks if evaluable)
+    items = [t for evaluable, matched, t in checks if evaluable and matched and t]
+    count = len(items)
+    return {"count": count, "total": total, "items": items,
+            "summary": f"該当{count}/{total}件"}
 
 
 # ====== ③ 決算評価（取得可能な日程のみ・予想比は未対応） ======
@@ -158,7 +314,7 @@ def earnings_view(s, calendar=None, today=None):
 
     戻り値: {"date_line": str, "beat_line": str, "soon": bool}
     """
-    today = today or datetime.now().date()
+    today = today or _today_jst()
     cal = calendar or {}
     ed = cal.get("earnings_date")
     du = _days_until(ed, today)
@@ -186,7 +342,7 @@ def event_view(s, calendar=None, today=None, horizon_days=14):
 
     戻り値: {"items": [str, ...], "has_event": bool}
     """
-    today = today or datetime.now().date()
+    today = today or _today_jst()
     cal = calendar or {}
     items = []
     xd = cal.get("ex_dividend_date")

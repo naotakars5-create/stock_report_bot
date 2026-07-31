@@ -16,7 +16,8 @@ CSV: data/promo_posts.csv
 
 import csv
 import os
-from datetime import datetime
+
+import market_calendar
 
 DEFAULT_PATH = os.path.join("data", "promo_posts.csv")
 FIELDS = ["posted_at", "post_date", "kind", "tweet_id", "text"]
@@ -59,7 +60,8 @@ def record(kind, tweet_id, text, post_date=None, posted_at=None, path=DEFAULT_PA
         if directory:
             os.makedirs(directory, exist_ok=True)
         rows = _read_rows(path)
-        now = posted_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 投稿日時・日付は JST 基準（Actions は UTC 稼働のため素の now は前日にずれる）。
+        now = posted_at or market_calendar.now_jst().strftime("%Y-%m-%d %H:%M:%S")
         rows.append({
             "posted_at": now,
             "post_date": post_date or now[:10],

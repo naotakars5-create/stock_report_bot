@@ -1,0 +1,26 @@
+# webhook/wrangler.toml
+# Cloudflare Workers の設定（機能拡張3・無料枠）。
+#
+# 初回セットアップ:
+#   1. npm install -g wrangler && wrangler login
+#   2. wrangler d1 create stock-report-subscribers
+#      → 出力された database_id を下の [[d1_databases]] に貼る
+#   3. wrangler d1 execute stock-report-subscribers --file=schema.sql --remote
+#   4. シークレット登録:
+#        wrangler secret put LINE_CHANNEL_SECRET
+#        wrangler secret put LINE_CHANNEL_ACCESS_TOKEN
+#        wrangler secret put EXPORT_TOKEN   ← 任意の長いランダム文字列
+#   5. wrangler deploy
+#   6. LINE Developers コンソールで Webhook URL を
+#      https://<worker名>.<アカウント>.workers.dev/webhook に設定し「利用する」をON
+#   7. GitHub Secrets に SUBSCRIBER_API_URL（workers.devのURL・/exportは付けない）と
+#      SUBSCRIBER_API_TOKEN（EXPORT_TOKENと同じ値）を登録
+
+name = "stock-report-webhook"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "stock-report-subscribers"
+database_id = "＜wrangler d1 create の出力をここに貼る＞"
