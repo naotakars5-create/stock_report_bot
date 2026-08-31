@@ -1,0 +1,70 @@
+name: Pattern Screener
+
+# 上昇チャートパターンの日次配信（株価のみ・J-Quants不要・当日終値で完結）。
+# 大引け後に走らせる（外部cron dispatch 推奨）。
+#   POST /repos/{owner}/{repo}/dispatches  {"event_type":"pattern-screen"}
+# schedule は保険（遅延あり）。JST17:30 = UTC08:30、UTC 月〜金。
+#
+# モード切替: SCREEN_MODE=value にすれば同じ仕組みで業種別PER割安版も動く
+# （その場合は JQUANTS_* が必要）。既定は pattern。
+on:
+  repository_dispatch:
+    types: [pattern-screen]
+  schedule:
+    - cron: "30 8 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "screening mode (pattern=上昇パターン / value=業種別PER割安)"
+        type: choice
+        options: ["pattern", "value"]
+        default: "pattern"
+      dry_run:
+        description: "配信・保存せず内容表示のみ"
+        type: boolean
+        default: false
+      max_stocks:
+        description: "対象銘柄数の上限（テスト短縮用・空=全銘柄）"
+        type: string
+        default: ""
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+      - name: スクリーニング＆配信
+        env:
+          SCREEN_MODE: ${{ inputs.mode }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          JQUANTS_MAILADDRESS: ${{ secrets.JQUANTS_MAILADDRESS }}
+          JQUANTS_PASSWORD: ${{ secrets.JQUANTS_PASSWORD }}
+          JQUANTS_REFRESH_TOKEN: ${{ secrets.JQUANTS_REFRESH_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          MAX_STOCKS: ${{ inputs.max_stocks }}
+        run: python screener_main.py --mode "${SCREEN_MODE:-pattern}"
+      - name: 検出CSVを保存（コミット）
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          if [ ! -d data ]; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git add data/
+          if git diff --staged --quiet; then
+            echo "データに変更はありません。"
+          else
+            git commit -m "Update pattern screener scores [skip ci]"
+            git push
+          fi
