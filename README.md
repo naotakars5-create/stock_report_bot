@@ -517,6 +517,78 @@ Phase1-2 は追加インフラなしで動き、読者設定が無い間は従�
 
 ---
 
+## 業種別PERランキング日次配信（sector_per）
+
+東証33業種ごとに「その業種の中で相対的に予想PERが低い銘柄」をランキングして配信する。
+絶対値フィルタ（PER15倍以下等）は使わず、必ず業種内の相対評価にする。
+
+### 構成（計算ロジックは配信層から完全分離）
+- `sector_per/config.py` … 全閾値・重み（母集団300億/1億/上場3年、ROE8%/自己資本30%、
+  重み0.6:0.4 …すべて可変・環境変数で上書き可）
+- `sector_per/ranking.py` … 母集団フィルタ→業種中央値→業種内割安度→自己過去比
+  パーセンタイル→バリュートラップ除外→総合スコア（純粋関数）
+- `sector_per/jquants_client.py` … J-Quants /fins/statements（予想EPS・自己資本・
+  純利益・売上高・業績予想修正）取得＋解析
+- `sector_per/pipeline.py` … 財務キャッシュ・EPS履歴→予想PER系列・銘柄レコード合成
+- `sector_per/delivery.py` … Flexカルーセル＋補足テキスト。**必須免責を構造的に強制**
+  （末尾に無ければ例外）／禁止語チェック（「注目」も禁止に追加済み）
+- `sector_per_main.py` … 17:30バッチ（休場日ガード・J-Quants失敗時は前日配信せず中止＋
+  管理者通知・全銘柄スコアCSV・計算過程ログ）
+- `.github/workflows/sector_per_report.yml` … 17:30 JST（外部cron `sector-per` dispatch）
+
+### データ源（ハイブリッド）
+- 当日終値・売買代金・上場年数 → **yfinance**（既存層を流用・当日取得可）
+- 財務（予想EPS・ROE・自己資本比率・増収増益・下方修正）→ **J-Quants**
+- 33業種 → 既存 `jpx_listed_companies.csv`（JPX公式）
+
+### J-Quantsプランと無料枠の制約
+`JQUANTS_MAILADDRESS`/`JQUANTS_PASSWORD`（または `JQUANTS_REFRESH_TOKEN`）を
+GitHub Secrets に設定。**無料枠は約12週間遅延・格納2年**のため、財務は約12週前基準
+（`fundamentals_asof` として配信・CSV・ログに明示）、自己過去比は使える年数に自動短縮。
+Standard(¥3,300/月)へは設定変更なしで切替可能（遅延が前営業日に縮む）。
+
+### サンプル・テスト
+- `python samples/generate_sector_per_sample.py` → `samples/sector_per_sample.md`
+  （Flex要点）＋ `samples/sector_per_scores_sample.csv`（検証用・全銘柄スコア）
+- `python tests/test_sector_per.py` … 中央値/割安度/過去比/バリュートラップ＋
+  エッジ（0件・1社・EPS null）を網羅
+
+---
+
+## 上昇チャートパターン配信（patterns）＋モード切替
+
+「割安（sector_per）」に対する「上昇パターン版」。株価チャートに特定の形状が現れた
+銘柄を機械的に検出し、**全体（業種問わず）で上位N**を配信する。**株価のみで判定する
+ため J-Quants 不要**（無料・当日終値で完結）。
+
+### 検出パターン（`patterns/detectors.py`・純粋関数）
+- ゴールデンクロス（25日線が75日線を上抜け＋価格が25日線上）
+- 新高値ブレイク（直近60日高値を更新＋出来高増加）
+- 三角保ち合い上放れ（高値切り下げ・安値切り上げの収束からの上抜け）
+- 移動平均接近後の反発（上昇基調で25日線付近まで調整→反発。※「押し目」語は不使用）
+- カップウィズハンドル（近似）
+
+過熱除外（直近5日+20%超・25日線から+25%超乖離）と流動性フィルタ（売買代金1億）付き。
+複数パターン確認でスコア加点。すべて設定（`patterns/config.py`）で可変。
+
+### モード切替（両方残し）
+`screener_main.py --mode {pattern,value}`（環境変数 `SCREEN_MODE` でも可）で
+上昇パターン版と業種別PER割安版を1コマンドで切替。配信層・データ層は既存を流用。
+- `.github/workflows/pattern_report.yml`（大引け後・`pattern-screen` dispatch。
+  `mode` 入力で value も実行可）
+
+### 表現・免責
+検出は「〇〇という形状が出た」の事実提示に留め、必須免責を配信末尾に構造的に強制
+（`patterns/delivery.py`・省略時は例外）。禁止語チェック（「押し目/注目/上がる」等）付き。
+
+### サンプル・テスト
+- `python samples/generate_pattern_sample.py` → `samples/pattern_sample.md` ＋
+  `samples/pattern_scores_sample.csv`（検証用・全銘柄検出一覧）
+- `python tests/test_patterns.py` … 各パターン検出・過熱/流動性除外・全体topN・
+  必須免責強制・禁止語なし（合成価格でネットワーク非依存）
+
+---
+
 ## LINE配信時の注意点
 
 - LINE配信は **「カード中心」** です。「**①サマリーカード → ②銘柄カルーセル（横スライドカード）

@@ -1,0 +1,69 @@
+name: Sector PER Ranking
+
+# 業種別PERランキング日次配信（大引け後 17:30 JST・当日終値ベース）。
+#
+# 起動は外部cron（cron-job.org 等）からの repository_dispatch を本線とする
+# （GitHubのscheduleは遅延が大きく「17:30配信」に間に合わないため）。
+#   POST /repos/{owner}/{repo}/dispatches  {"event_type":"sector-per"}
+#   → 平日 17:30 JST に起動。土日祝・年末年始は sector_per_main.py 側でスキップ。
+# 下の schedule は保険（遅延あり）。JST17:30 = UTC08:30、UTC 月〜金(1-5)。
+#
+# J-Quants(財務)取得に失敗した場合、前日データでは配信せず中止し管理者へ通知する
+# （sector_per_main.py に実装）。
+on:
+  repository_dispatch:
+    types: [sector-per]
+  schedule:
+    - cron: "30 8 * * 1-5"   # 予備。08:30 UTC 月〜金 = 17:30 JST（遅延あり）
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "配信・保存せず内容表示のみ"
+        type: boolean
+        default: false
+
+jobs:
+  ranking:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write   # fundamentals_cache / スコアCSV のコミット用
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      - name: ランキング生成＆配信
+        env:
+          JQUANTS_MAILADDRESS: ${{ secrets.JQUANTS_MAILADDRESS }}
+          JQUANTS_PASSWORD: ${{ secrets.JQUANTS_PASSWORD }}
+          JQUANTS_REFRESH_TOKEN: ${{ secrets.JQUANTS_REFRESH_TOKEN }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: python sector_per_main.py
+
+      - name: 財務キャッシュ・スコアCSVを保存（コミット）
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          if [ ! -d data ]; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git add data/
+          if git diff --staged --quiet; then
+            echo "データに変更はありません。"
+          else
+            git commit -m "Update sector PER fundamentals cache and scores [skip ci]"
+            git push
+          fi
